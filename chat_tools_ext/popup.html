@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {
+    width: 260px;
+    padding: 12px 14px;
+    margin: 0;
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 13px;
+    background: #1e1e1e;
+    color: #ddd;
+  }
+  h3 {
+    margin: 0 0 10px;
+    font-size: 14px;
+    color: #fff;
+  }
+  label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    padding: 4px 0;
+  }
+  input[type="checkbox"] {
+    width: 15px;
+    height: 15px;
+    accent-color: #339af0;
+    cursor: pointer;
+  }
+
+  /* 프로필 섹션 */
+  .section-title {
+    font-size: 11px;
+    color: #888;
+    margin: 14px 0 6px;
+    padding-top: 10px;
+    border-top: 1px solid #333;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .profile-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .profile-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.12s;
+    position: relative;
+  }
+  .profile-item:hover {
+    background: #2a2a2a;
+  }
+  .profile-item.active {
+    background: #1a3a2a;
+  }
+  .profile-nick {
+    flex: 1;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .profile-item.active .profile-nick {
+    font-weight: 600;
+    color: #fff;
+  }
+  .profile-badge {
+    font-size: 10px;
+    color: #51cf66;
+    display: none;
+    flex-shrink: 0;
+  }
+  .profile-item.active .profile-badge {
+    display: inline;
+  }
+  .profile-delete {
+    display: none;
+    border: none;
+    background: transparent;
+    color: #666;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0 2px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .profile-item:hover .profile-delete {
+    display: inline;
+  }
+  .profile-item.active .profile-delete {
+    display: none;
+  }
+  .profile-delete:hover {
+    color: #e03131;
+  }
+  .profile-empty {
+    color: #666;
+    font-size: 12px;
+    padding: 4px 0;
+  }
+</style>
+</head>
+<body>
+  <h3>롤디칩</h3>
+
+  <div class="section-title">프로필</div>
+  <div id="profileList" class="profile-list">
+    <div class="profile-empty">로그인 기록 없음</div>
+  </div>
+
+  <div class="section-title">설정</div>
+  <label>
+    <input type="checkbox" id="blockLivechat">
+    <span>라이브챗 차단</span>
+  </label>
+  <label>
+    <input type="checkbox" id="compactBoard">
+    <span>자유게시판 컴팩트 모드 (영상 유지)</span>
+  </label>
+  <label>
+    <input type="checkbox" id="newBoardApi">
+    <span>자유게시판 신버전 대응 (신 서버 연동)</span>
+  </label>
+  <label>
+    <input type="checkbox" id="unloadGuard">
+    <span>새로고침·뒤로가기 시 이탈 확인창 표시</span>
+  </label>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,2 +1,32 @@
 _기타 파일들/
 static/영수증.xlsx
+
+# Dependencies
+node_modules/
+
+# Config files (API keys, DB credentials)
+db_config.txt
+twitch_config.txt
+danbooru_config.txt
+
+# Google Cloud credentials
+*.json
+!package.json
+!package-lock.json
+
+# TTS generated files
+tts/
+
+# FTP uploads
+ftp/
+
+# SSL certificates
+*.pem
+
+*.apk
+*.xapk
+*.json
+*.zip
+
+lolwiki/
+
