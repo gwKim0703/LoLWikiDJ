@@ -287,6 +287,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  // ── 차단 대상의 숫자 user id 조회 (구 post_seq → 모던 글 상세의 author.id) ──
+  if (msg.kind === 'authorNumId') {
+    (async () => {
+      const id = await resolveNewId(p.post_seq, p.author_id);
+      if (!id) { sendResponse({ ok: false, error: 'resolve failed' }); return; }
+      const r = await fetch(`${LOLAPI_BASE}/board/posts/${enc(id)}`, { headers: LOLAPI_HEADERS }).catch(() => null);
+      const j = r && await r.json().catch(() => null);
+      const pp = (j && (j.post || j.data)) || j;
+      const a = pp && pp.author;
+      sendResponse(a && a.id != null
+        ? { ok: true, author_id: a.id, nickname: a.nickname }
+        : { ok: false, error: 'no author id' });
+    })().catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
+    return true;
+  }
+
+  // ── 유저 차단/해제 (POST /blocks. body: blocker_local_user_key, blocked_user_id(숫자), blocked) ──
+  if (msg.kind === 'blockUser') {
+    respond(sendResponse, authedFetch(`${LOLAPI_BASE}/blocks`,
+      { method: 'POST', body: JSON.stringify({ blocker_local_user_key: p.local_user_key, blocked_user_id: Number(p.blocked_user_id), blocked: p.blocked !== false }) },
+      { 'Content-Type': 'application/json' }));
+    return true;
+  }
+
   // ── 알림센터: 알림(푸시) 목록/읽음 ──
   if (msg.kind === 'notifs') {
     respond(sendResponse, authedFetch(`${LOLAPI_BASE}/push/notifications`, {}));
@@ -342,6 +366,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   } else if (msg.kind === 'commentsById') {
     // 신 댓글 저장소(작성 댓글 포함 전체) — 구 post_seq를 신 id로 해석해 사용
     url = `${LOLAPI_BASE}/board/posts/${enc(p.id)}/comments`;
+  } else if (msg.kind === 'blocks') {
+    // 차단 목록(내가 차단한 유저) — local_user_key만으로 조회(무인증). results:[{id,nickname,avatar_url}]
+    url = `${LOLAPI_BASE}/blocks?local_user_key=${enc(p.local_user_key)}`;
+  } else if (msg.kind === 'listModern') {
+    // 모던 목록 — 차단 숫자 id 매칭용(author 객체의 숫자 id + legacy_post_seq 로 레거시 목록과 조인).
+    url = `${LOLAPI_BASE}/board/posts?limit=${enc(p.limit != null ? p.limit : 30)}`;
+    if (p.q) url += `&q=${enc(p.q)}`;
+    if (p.nickname) url += `&nickname=${enc(p.nickname)}`;
+    if (p.mode) url += `&mode=${enc(p.mode)}`;
   } else {
     sendResponse({ ok: false, error: 'unknown kind: ' + msg.kind });
     return true;

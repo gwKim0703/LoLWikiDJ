@@ -129,6 +129,83 @@
     return false;
   }
 
+  /* ---------------- 차단(모바일 앱에서 차단한 유저) ----------------
+     신 API GET /blocks 는 {id(숫자 user id), nickname, avatar_url} 를 준다.
+     - 견고한 매칭은 '숫자 user id'. 하지만 게시판 표시는 legacy-read-compat(author_id=문자열)라
+       숫자 id가 없으므로, 모던 엔드포인트(/board/posts, /board/posts/{id}/comments)를 병렬로
+       보강해 각 글/댓글의 숫자 author id를 얻어 매칭한다(legacy_post_seq / comment_seq 로 조인).
+     - 조인이 불가한 항목(깊은 페이지·작성자별 목록 등)은 '닉네임'으로 폴백 매칭한다. */
+  let _blocksAt = 0, _blocksInFlight = null;
+  const CTH_LEGACY_CSEQ_OFFSET = 1000000000;   // legacy comment_seq = 모던 댓글 id + 10억
+  function isBlockedById(numId) {
+    const set = W.__cthBlockedIds;
+    return !!(set && set.size && numId != null && numId !== '' && set.has(String(numId)));
+  }
+  function isBlockedByNick(nick) {
+    const set = W.__cthBlockedNicks;
+    const n = s(nick).trim();
+    return !!(set && set.size && n && set.has(n));
+  }
+  // 숫자 id를 알면 그걸로만 판정(정확 — 동일 닉 다른 유저 오판 방지), 모르면 닉네임 폴백.
+  function isBlocked(numId, nick) {
+    if (numId != null && numId !== '') return isBlockedById(numId);
+    return isBlockedByNick(nick);
+  }
+  async function loadBlocks(force) {
+    const key = W.__cthLocalUserKey;
+    if (!key) { W.__cthBlockedIds = new Set(); W.__cthBlockedNicks = new Set(); return; }
+    const fresh = W.__cthBlockedIds && (Date.now() - _blocksAt < 30000);
+    if (!force && fresh) return;
+    if (_blocksInFlight) return _blocksInFlight;         // 동시 호출 합치기
+    _blocksInFlight = (async () => {
+      try {
+        const resp = await apiFetch('blocks', { local_user_key: key });
+        const ids = new Set(), nicks = new Set();
+        if (resp && resp.ok && resp.data && Array.isArray(resp.data.results)) {
+          for (const b of resp.data.results) {
+            if (b && b.id != null) ids.add(String(b.id));
+            const n = s(b && b.nickname).trim(); if (n) nicks.add(n);
+          }
+        }
+        W.__cthBlockedIds = ids; W.__cthBlockedNicks = nicks; _blocksAt = Date.now();
+      } catch (e) { /* 실패 시 이전 값 유지 */ } finally { _blocksInFlight = null; }
+    })();
+    return _blocksInFlight;
+  }
+  // 모던 목록에서 legacy_post_seq → 숫자 author id 맵을 만든다(조인 가능한 목록 모드에서만).
+  async function fetchPostAuthorIdMap(params) {
+    // 모던 /board/posts 는 q·nickname·mode 만 지원(author_id·offset 미지원) → 첫 페이지·검색·인기만 조인
+    if (params.author_id || (params.offset || 0) !== 0) return null;
+    try {
+      const mp = { limit: params.limit || 30 };
+      if (params.q) mp.q = params.q;
+      if (params.nickname) mp.nickname = params.nickname;
+      if (params.mode) mp.mode = params.mode;
+      const resp = await apiFetch('listModern', mp);
+      if (!resp || !resp.ok || !resp.data || !Array.isArray(resp.data.results)) return null;
+      const map = {};
+      for (const m of resp.data.results) {
+        const seq = m && m.legacy_post_seq, aid = m && m.author && m.author.id;
+        if (seq != null && aid != null) map[String(seq)] = String(aid);
+      }
+      return map;
+    } catch (e) { return null; }
+  }
+  // 모던 댓글에서 legacy comment_seq → 숫자 author id 맵을 만든다.
+  async function fetchCommentAuthorIdMap(post, postSeq) {
+    try {
+      const modernId = await resolvePostId(post, postSeq);
+      if (!modernId) return null;
+      const resp = await apiFetch('commentsById', { id: modernId });
+      if (!resp || !resp.ok || !resp.data || !Array.isArray(resp.data.results)) return null;
+      const map = {};
+      for (const m of resp.data.results) {
+        if (m && m.id != null && m.author_id != null) map[String(m.id + CTH_LEGACY_CSEQ_OFFSET)] = String(m.author_id);
+      }
+      return map;
+    } catch (e) { return null; }
+  }
+
   /* ---------------- 신 API → 구 클라이언트 데이터 매핑 ---------------- */
   // 구 목록 아이템 형태(8080.js lol_get_article_list의 반환 형태)에 맞춘다.
   function mapListItem(p) {
@@ -337,6 +414,9 @@
   function fixupDetail() {
     const d = W.g_lol_current_detail;
     if (!d || !d.__cthOurs) return;          // 우리가 채운 상세일 때만 (아바타 유무와 무관)
+    // 내 글에는 '[차단하기]'(=자신 차단) 숨김
+    const bb = document.getElementById('lol_rpanel_header_button');
+    if (bb) bb.style.display = (d.my_post === '1') ? 'none' : '';
     setImg(document.getElementById('lol_rpanel_header_icon'), d.__cthAvatar);
     // #3 공유 버튼 아이콘: 사이트 렌더(lol_get_icon_url('') → 흰 이미지)를 덮어써
     // 실제 글쓴이 아바타의 미러 URL로 지정한다. 채팅 공유 카드는 icon_img를
@@ -393,17 +473,30 @@
     } else if (req.vote) {
       params.mode = 'popular';                                    // 인기글(추천순)
     }
-    const resp = await apiFetch('list', params);
+    const listP = apiFetch('list', params);
+    await loadBlocks();
+    const hasBlocks = (W.__cthBlockedIds && W.__cthBlockedIds.size) || (W.__cthBlockedNicks && W.__cthBlockedNicks.size);
+    // 차단이 있을 때만 모던 목록으로 숫자 author id 맵을 보강(불필요한 요청 방지)
+    const postAuthorMap = hasBlocks ? await fetchPostAuthorIdMap(params) : null;
+    const resp = await listP;
     if (!resp || !resp.ok || !resp.data || !Array.isArray(resp.data.results)) {
       log('list fetch 실패, 서버 폴백', resp && resp.error);
       _origEmit('lol_get_article_list', req);
       return;
     }
-    const results = resp.data.results;
+    const rawResults = resp.data.results;
+    // 차단 유저의 글은 숨긴다: 모던 조인으로 얻은 숫자 id 우선, 없으면 닉네임 폴백.
+    // 표시만 제외하고 페이지 커서는 서버 반환 기준 유지.
+    const results = rawResults.filter(r => {
+      if (!r) return false;
+      const numId = postAuthorMap ? postAuthorMap[String(r.post_seq)] : undefined;
+      return !isBlocked(numId, r.author);
+    });
     const mapped = results.map(mapListItem);
     // offset=0 에서 API가 공지글을 맨 앞에 하나 더 얹어줘(limit+1개) 반환한다.
     // 페이지네이션 커서는 '공지 제외' 개수만큼 전진시켜야 다음 페이지에서 글이 누락되지 않는다.
-    const nonNotice = results.filter(r => !r.notice).length;
+    // (차단 필터로 화면 개수가 줄어도 커서는 서버가 실제 반환한 개수만큼 전진해야 페이지 누락이 없다)
+    const nonNotice = rawResults.filter(r => !r.notice).length;
     W.g_lol_article_scroll_seq = (req.seq || 0) + nonNotice;
     W.g_lol_article_list = (W.g_lol_article_list || []).concat(mapped);
     W.lol_lpanel_update();                    // 래핑됨 → fixupList 자동 호출
@@ -498,7 +591,16 @@
       if (token !== _detailToken) return;
       showCommentsLoading(false);
     }
-    const rawReplys = (cr && cr.ok && cr.data && Array.isArray(cr.data.results)) ? cr.data.results.map(mapReply) : [];
+    await loadBlocks();   // 차단 목록 최신화(대개 목록 로드에서 캐시됨 → 즉시 반환)
+    const hasBlocks = (W.__cthBlockedIds && W.__cthBlockedIds.size) || (W.__cthBlockedNicks && W.__cthBlockedNicks.size);
+    // 차단이 있을 때만 모던 댓글로 숫자 author id 맵 보강 → 숫자 우선, 없으면 닉네임 폴백
+    const cmap = hasBlocks ? await fetchCommentAuthorIdMap(post, req.post_seq) : null;
+    if (token !== _detailToken) return;
+    const rawReplys = (cr && cr.ok && cr.data && Array.isArray(cr.data.results))
+      ? cr.data.results.filter(c => {
+          const numId = cmap ? cmap[String(c && c.comment_seq)] : undefined;
+          return !isBlocked(numId, c && c.author);
+        }).map(mapReply) : [];
     applyDetail(mapDetail(post, threadReplies(rawReplys)));   // 최종 렌더(댓글 포함)
     showDetailLoading(false);                  // 이미지는 이후 <img>가 비동기 로드(표시를 막지 않음)
   }
@@ -598,6 +700,51 @@
     }
   }
 
+  /* 유저 차단 (사이트 '[차단하기]' 버튼 lol_rpanel_header_button 클릭 → 신 API POST /blocks)
+     서버 차단 목록은 앱과 공유되므로, 여기서 차단하면 앱 차단 목록에도 반영된다. */
+  async function handleBlockUser() {
+    const d = W.g_lol_current_detail;
+    if (!d || d.post_seq == null || s(d.post_seq).length === 0) return;
+    const myKey = W.__cthLocalUserKey;
+    if (!myKey) { alert('로그인이 필요합니다.'); return; }
+    const nick = s(d.nickname);
+    const authorId = s(d.__cthAuthorId || d.author_id);
+    if (d.my_post === '1' || isMyContent(authorId)) { alert('자신은 차단할 수 없습니다.'); return; }
+    if (!W.confirm((nick || '이 사용자') + ' 님을 차단하시겠습니까?\n차단한 사용자의 글과 댓글은 보이지 않습니다.')) return;
+    // 차단엔 대상의 숫자 user id가 필요 → 모던 글 상세의 author.id 로 해석
+    const idr = await apiFetch('authorNumId', { post_seq: d.post_seq, author_id: authorId });
+    if (!idr || !idr.ok || idr.author_id == null) { alert('차단 대상 정보를 확인하지 못했습니다.'); return; }
+    const resp = await apiFetch('blockUser', { local_user_key: myKey, blocked_user_id: idr.author_id, blocked: true });
+    console.log('[cth-board] blockUser:', resp);
+    if (resp && resp.ok) {
+      // 로컬 차단 캐시 즉시 반영(재조회 없이 바로 숨김)
+      W.__cthBlockedIds = W.__cthBlockedIds || new Set(); W.__cthBlockedIds.add(String(idr.author_id));
+      if (nick) { W.__cthBlockedNicks = W.__cthBlockedNicks || new Set(); W.__cthBlockedNicks.add(nick.trim()); }
+      try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}   // 목록 새로고침(차단 글 제외)
+      const back = document.getElementById('cth-board-back-detail'); // 컴팩트: 목록 뷰로 복귀
+      if (back) back.click();
+      setTimeout(() => alert((nick || '사용자') + ' 님을 차단했습니다.'), 30);
+    } else {
+      alert('차단 실패: ' + writeErr(resp));
+    }
+  }
+  // 사이트가 index.js 에서 lol_rpanel_header_button.onclick = lol_onclick_auth_or_block(원본참조)로 바인딩.
+  // 그 버튼의 onclick 을 교체해, 신모드+로그인 상태면 차단을 수행하고, 그 외(게스트=로그인요청)엔 원본 호출.
+  function ensureBlockButtonBound() {
+    const btn = document.getElementById('lol_rpanel_header_button');
+    if (!btn || btn.__cthBlockBound) return;
+    btn.__cthBlockBound = true;
+    btn.onclick = function (e) {
+      if (document.documentElement.dataset.cthNewBoard !== '0'
+          && W.g_lol_android_id && W.g_lol_android_id !== W.g_lol_guest_id) {
+        if (e && e.preventDefault) e.preventDefault();
+        handleBlockUser();
+        return;
+      }
+      if (typeof W.lol_onclick_auth_or_block === 'function') return W.lol_onclick_auth_or_block.call(this, e);
+    };
+  }
+
   /* 내 댓글 삭제 (사이트 lol_onclick_delete_reply → lol_delete_reply emit) */
   async function handleDeleteComment(data) {
     const postSeq = data && data.post_seq;
@@ -652,6 +799,8 @@
     try { W.lol_lpanel_update(); } catch (e) {}
     try { W.lol_rpanel_update(); } catch (e) {}
     if (avatar) setImg(document.getElementById('lol_lpanel_account_icon'), avatar);
+    W.__cthBlockedIds = new Set(); W.__cthBlockedNicks = new Set(); _blocksAt = 0;   // 계정 전환 시 캐시 폐기
+    loadBlocks(true).catch(function () {});            // 새 계정의 차단 목록 선반영
     log('로그인 상태 적용:', nickname);
   }
 
@@ -772,6 +921,7 @@
         const r = orig.apply(this, arguments);
         try { fixupDetail(); } catch (e) {}
         try { decorateAllReplies(); } catch (e) {}
+        try { ensureBlockButtonBound(); } catch (e) {}   // '[차단하기]' 버튼에 신 API 차단 연결
         return r;
       };
       W.lol_rpanel_update.__cthWrapped = true;
@@ -815,8 +965,8 @@
     const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(iso || '')); if (!m) return '';
     const ep = Date.parse(m[1] + '-' + m[2] + '-' + m[3] + 'T' + m[4] + ':' + m[5] + ':' + (m[6] || '00') + '+09:00');
     const sec = Math.floor((Date.now() - ep) / 1000), min = Math.floor(sec / 60);
-    if (sec < 60) return Math.max(0, sec) + '초 전';
-    if (min < 60) return min + '분 전';
+    if (sec < 60) return Math.max(0, sec) + '초전';
+    if (min < 60) return min + '분전';
     const nk = new Date(Date.now() + 9 * 3600 * 1000);
     if (nk.getUTCFullYear() == +m[1] && nk.getUTCMonth() + 1 == +m[2] && nk.getUTCDate() == +m[3]) return m[4] + ':' + m[5];
     return m[1] + '-' + m[2] + '-' + m[3];
