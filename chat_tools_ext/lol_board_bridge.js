@@ -474,7 +474,9 @@
       params.mode = 'popular';                                    // 인기글(추천순)
     }
     const listP = apiFetch('list', params);
-    await loadBlocks();
+    // 새 목록(offset 0 = 새로고침 버튼·최초 로드·검색 등)에서는 차단 목록을 강제 갱신 →
+    // 앱에서 차단/해제한 게 새로고침 시 바로 반영. 스크롤 페이지네이션(offset>0)은 캐시 유지.
+    await loadBlocks((req.seq || 0) === 0);
     const hasBlocks = (W.__cthBlockedIds && W.__cthBlockedIds.size) || (W.__cthBlockedNicks && W.__cthBlockedNicks.size);
     // 차단이 있을 때만 모던 목록으로 숫자 author id 맵을 보강(불필요한 요청 방지)
     const postAuthorMap = hasBlocks ? await fetchPostAuthorIdMap(params) : null;
