@@ -1,0 +1,8 @@
+{
+  "scripts": {
+    "test": "node --test --test-isolation=none lolwiki-api.test.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

@@ -30,3 +30,8 @@ ftp/
 
 lolwiki/
 
+# Build / runtime output (upstream)
+.omx/
+.next/
+data/
+dist/
