@@ -1,16 +1,13 @@
-/* background.js — 자유게시판 신 API 중계 */
-
-/* ============================================================
- * 자유게시판 신 API 중계 (앱 v2.0.3 이후)
- * 구 lolwiki.kr PHP 엔드포인트가 2026-07-19 04:00:23에 동결되어,
- * 신 REST API(https://lolwiki.kr/api/app/api/v1)에서 목록/글/댓글을 읽어온다.
- * 읽기는 인증 불필요. background에서 fetch하여 CORS를 우회한다.
- * (자세한 API 규격은 API_NOTES.md 참고)
- * ============================================================ */
-/* 참고: 이미지 첨부(img.lolwiki.kr 업로드)는 앱이 SecurityGuard(libEncryptorP/Wua)로 매 요청
-   동적 생성하는 서명을 요구한다(기기 비밀키 기반·요청마다 상이). 브라우저 확장(JS)에서는
-   이 서명을 재현할 수 없어 이미지 업로드는 지원 불가. (텍스트/유튜브 작성은 서명 불필요라 동작)
-   아래 uploadImage 코드는 남겨두지만, 실제로는 img 호스트가 항상 "로그인 필요"로 거부한다. */
+/* background.js — 신 API 중계 (확장 보조 기능 전용)
+ *
+ * 자유게시판 데이터(목록·글·댓글·작성·삭제·차단·이미지 첨부)는 DJ 사이트가 신 REST API로
+ * 직접 처리한다. 확장이 중계하는 것은 사이트가 아직 제공하지 않는 기능뿐이다.
+ *   login/logout/authState : 사이트 로그인 자격증명으로 확장도 토큰 확보(별도 로그인 없음)
+ *   profile                : 내 프로필 최신값(GET /users/me) — 좌측 상단 아이콘 즉시 갱신
+ *   vote / detail          : 추천·비추천(토글)과 '내 추천 상태' 조회
+ *   notifs/notifRead/memo* : 알림센터(알림·쪽지)
+ * 호출은 CORS 우회를 위해 background에서 수행한다. (API 규격은 API_NOTES.md 참고)
+ */
 
 const LOLAPI_BASE = 'https://lolwiki.kr/api/app/api/v1';
 const LOLAPI_HEADERS = {
@@ -69,76 +66,96 @@ function respond(sendResponse, promise) {
     .catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
 }
 
-// 이미지 업로드(멀티파트) → { ok, image_id, image_format, image_url }
-// 앱 v2.0.3 libapp.so 분석 기준: POST https://img.lolwiki.kr/api/images, 멀티파트 필드 'file',
-// Bearer 인증 필요, 응답 봉투 {success, message, data:{...}}. 응답 키는 방어적으로 파싱한다.
-async function uploadImage(imageData, isGif) {
-  if (!imageData) return { ok: false, error: 'no image' };
-  const auth = await getAuth();
-  if (!auth || !auth.token) return { ok: false, error: '로그인이 필요합니다(이미지 업로드).' };
-  let b64 = imageData, mime = isGif ? 'image/gif' : 'image/jpeg';
-  const m = /^data:([^;]+);base64,(.*)$/i.exec(imageData);
-  if (m) { mime = m[1]; b64 = m[2]; }
-  let bytes;
-  try { bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)); }
-  catch (e) { return { ok: false, error: 'invalid image data' }; }
-  const blob = new Blob([bytes], { type: mime });
-  const fmt = isGif ? 'gif' : (mime.indexOf('png') >= 0 ? 'png' : 'jpg');
-  // 앱과 동일하게 Bearer + X-Device-ID 를 함께 보낸다 (img.lolwiki.kr도 이 조합을 검증).
-  const buildHeaders = (a) => Object.assign({}, LOLAPI_HEADERS,
-    (a && a.device_id) ? { 'X-Device-ID': a.device_id } : {},
-    { 'Authorization': 'Bearer ' + a.token });
+/* ---------------- 이미지 업로드 (답글 첨부용) ----------------
+   DJ 사이트 서버(lolwiki-api.js uploadImage)와 동일한 방식이다.
+     · multipart 필드: password('lolwiki-app-marker') + image(파일)
+     · Authorization 헤더는 붙이지 않는다 — 붙이면 '등록 된 앱이 아닙니다'로 거부된다.
+   업로드로 받은 image_id 를 pending 등록한 뒤 댓글 작성 본문에 넣는다. */
+const IMAGE_UPLOAD_URL = 'https://img.lolwiki.kr/api/images';
+const IMAGE_UPLOAD_PASSWORD = 'lolwiki-app-marker';
 
-  // 필드명 순차 시도. 성공 → {ok,...}, 인증실패 → {authFail:true, ...}, 그 외 → 마지막 진단객체
-  async function tryUpload(a) {
-    let last = null;
-    for (const field of ['file', 'files', 'image', 'images']) {
-      let r, j;
-      try {
-        const fd = new FormData();
-        fd.append(field, blob, 'image.' + fmt);
-        r = await fetch('https://img.lolwiki.kr/api/images', { method: 'POST', headers: buildHeaders(a), body: fd });
-        j = await r.json().catch(() => null);
-      } catch (e) { last = { error: String((e && e.message) || e) }; continue; }
-      console.log('[cth-bg] uploadImage field=' + field, r.status, j);
-      if (j && j.success === false && typeof j.message === 'string' && j.message.indexOf('로그인') !== -1) {
-        return { authFail: true, status: r.status, data: j };   // 필드 바꿔도 소용없음
-      }
-      last = { status: r.status, data: j };
-      if (r.ok && j && j.success !== false) {
-        const d = j.data || j;
-        const image_id = d.image_id || d.id || (d.image && (d.image.id || d.image.image_id));
-        const image_url = d.image_url || d.url || d.original_url || d.imageUrl || (d.image && d.image.url) || '';
-        const resFmt = d.image_format || d.format || fmt;
-        if (image_id != null && String(image_id) !== '') {
-          return { ok: true, image_id: String(image_id), image_format: String(resFmt), image_url: image_url };
-        }
-      }
+/* img 서버는 Origin 헤더가 붙은 요청을 '등록 된 앱이 아닙니다'로 거부한다.
+   (앱·DJ 서버는 Origin 없이 보내므로 통과 / 허용되는 Origin 은 https://lolwiki.kr 뿐)
+   확장 fetch 는 Origin: chrome-extension://... 을 자동으로 붙이므로 제거할 수 없다.
+   → 업로드 요청에 한해 declarativeNetRequest 로 Origin 을 허용값으로 바꿔 보낸다. */
+const DNR_ORIGIN_RULE_ID = 1701;
+let _dnrReady = null;
+function ensureUploadOriginRule() {
+  if (_dnrReady) return _dnrReady;
+  _dnrReady = (async () => {
+    try {
+      if (!chrome.declarativeNetRequest || !chrome.declarativeNetRequest.updateSessionRules) return false;
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [DNR_ORIGIN_RULE_ID],
+        addRules: [{
+          id: DNR_ORIGIN_RULE_ID,
+          priority: 1,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [{ header: 'origin', operation: 'set', value: 'https://lolwiki.kr' }]
+          },
+          condition: { urlFilter: '||img.lolwiki.kr/api/images', resourceTypes: ['xmlhttprequest'] }
+        }]
+      });
+      console.log('[cth-bg] 업로드 Origin 규칙 등록됨');
+      return true;
+    } catch (e) {
+      console.log('[cth-bg] 업로드 Origin 규칙 등록 실패:', e);
+      return false;
     }
-    return last || {};
-  }
-
-  let res = await tryUpload(auth);
-  if (res && res.authFail && auth.refresh) {          // 토큰 만료로 보이면 refresh 후 1회 재시도
-    const na = await refreshToken();
-    if (na) { auth = na; res = await tryUpload(na); }
-  }
-  if (res && res.ok) return res;
-  if (res && res.authFail) return { ok: false, error: '로그인이 필요합니다(토큰 만료/불일치). 다시 로그인해 주세요.' };
-  const msg = res && res.data && (res.data.message || (res.data.detail && JSON.stringify(res.data.detail)));
-  return { ok: false, error: 'image upload failed' + (msg ? (' — ' + msg) : '') };
+  })();
+  return _dnrReady;
 }
-async function registerPending(image_id, image_format) {
-  const r = await authedFetch(`${LOLAPI_BASE}/board/legacy-write/images/pending`, {
-    method: 'POST', body: JSON.stringify({ image_id: image_id, image_format: image_format })
-  }, { 'Content-Type': 'application/json' }).catch(() => null);
-  console.log('[cth-bg] registerPending', image_id, r && r.status);
-  return !!(r && r.ok);
+function b64ToBytes(b64) {
+  // data: 접두 제거 → 공백/개행 제거 → URL-safe 문자 복원 → 패딩 보정(전송 중 변형 대비)
+  let str = String(b64).replace(/^data:[^,]*,/, '').replace(/\s+/g, '')
+    .replace(/-/g, '+').replace(/_/g, '/');
+  const rem = str.length % 4;
+  if (rem === 2) str += '==';
+  else if (rem === 3) str += '=';
+  else if (rem === 1) str = str.slice(0, -1);        // 손상된 마지막 1글자는 버린다
+  const bin = atob(str);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
 }
-
-// 구 post_seq → 신 post id 해석
-// (1) 이전 이후 글: id = post_seq - offset (offset은 신 board 최신글에서 동적 도출) — GET으로 검증
-// (2) 이전 이전 글(레거시 작성자): legacy-identity(author_id)로 매핑
+// format: 'gif' | 'webp' | 'jpg'(기본). GIF·WebP 는 캔버스 변환 시 애니메이션이 사라지므로
+// 원본 바이트를 그대로 올리고 형식도 그대로 알린다.
+const IMAGE_MIME = { gif: 'image/gif', webp: 'image/webp', jpg: 'image/jpeg' };
+async function uploadImage(imageData, format) {
+  if (!imageData) return { ok: false, error: 'no image' };
+  const fmt = IMAGE_MIME[format] ? format : 'jpg';
+  let bytes;
+  try {
+    bytes = b64ToBytes(imageData);
+  } catch (e) {
+    return { ok: false, error: 'base64 디코딩 실패(len=' + String(imageData).length + '): ' + ((e && e.message) || e) };
+  }
+  if (!bytes.length) return { ok: false, error: 'empty image' };
+  const originOk = await ensureUploadOriginRule();     // Origin 치환 규칙 준비(없으면 서버가 거부)
+  const auth = await getAuth();
+  const fd = new FormData();
+  fd.append('password', IMAGE_UPLOAD_PASSWORD);
+  fd.append('image', new Blob([bytes], { type: IMAGE_MIME[fmt] }),
+    'lolwikidj-' + Date.now().toString(36) + '.' + fmt);
+  const headers = Object.assign({}, LOLAPI_HEADERS);          // Authorization 없음(의도적)
+  if (auth && auth.device_id) headers['X-Device-ID'] = auth.device_id;
+  let r, netErr = '';
+  try {
+    r = await fetch(IMAGE_UPLOAD_URL, { method: 'POST', headers, body: fd });
+  } catch (e) { netErr = 'fetch 실패: ' + ((e && e.message) || e); }
+  const j = r && await r.json().catch(() => null);
+  const id = j && ((j.data && j.data.id) || j.image_id || j.id);
+  console.log('[cth-bg] uploadImage bytes=' + bytes.length, 'originRule=' + originOk, r && r.status,
+    id || netErr || (j && j.message));
+  if (r && r.ok && id) return { ok: true, image_id: String(id), image_format: fmt };
+  let why = netErr || (j && (j.message || j.detail)) || ('HTTP ' + (r ? r.status : '?'));
+  if (!originOk && /등록/.test(String(why))) why += ' (Origin 치환 규칙 미적용 — 확장을 새로고침해 주세요)';
+  return { ok: false, error: why };
+}
+/* ---------------- 구 post_seq → 신 post id 해석 (차단 대상의 숫자 user id 확보용) ----------------
+   신 게시글 id 는 구 post_seq 에서 일정한 offset 을 뺀 값이라, 최신 글에서 offset 을 구해 추정한 뒤
+   실제로 조회해 legacy_post_seq 가 일치하는지 검증한다. 실패 시 레거시 작성자는 legacy-identity 로 매핑. */
 let _seqOffset = null;
 async function getSeqOffset() {
   if (_seqOffset != null) return _seqOffset;
@@ -155,7 +172,7 @@ async function resolveNewId(post_seq, author_id) {
     if (guess > 0) {
       const r = await fetch(`${LOLAPI_BASE}/board/posts/${enc(guess)}`, { headers: LOLAPI_HEADERS }).catch(() => null);
       const j = r && r.ok && await r.json().catch(() => null);
-      const pp = j && j.post;
+      const pp = j && (j.post || j.data || j);
       if (pp && String(pp.legacy_post_seq) === String(post_seq)) return guess;   // 검증 통과
     }
   }
@@ -167,6 +184,14 @@ async function resolveNewId(post_seq, author_id) {
   }
   return null;
 }
+
+async function registerPending(image_id, image_format) {
+  const r = await authedFetch(`${LOLAPI_BASE}/board/legacy-write/images/pending`, {
+    method: 'POST', body: JSON.stringify({ image_id, image_format })
+  }, { 'Content-Type': 'application/json' }).catch(() => null);
+  return !!(r && r.ok);
+}
+
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type !== 'cth-lolapi') return; // 다른 리스너가 처리
@@ -214,100 +239,179 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
-  // ── 구 post_seq → 신 id 해석 (offset 검증 + legacy-identity) ──
-  if (msg.kind === 'resolveId') {
-    resolveNewId(p.post_seq, p.author_id)
-      .then((id) => sendResponse({ ok: id != null, id: id }))
-      .catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
+  // ── 내 프로필(닉네임/스택/아바타) 최신값 — 다른 앱에서 아이콘 변경 시 새로고침으로 즉시 반영 ──
+  if (msg.kind === 'profile') {
+    respond(sendResponse, authedFetch(`${LOLAPI_BASE}/users/me`, {}));
     return true;
   }
 
-  // ── 글쓰기 (Bearer, 이미지 있으면 업로드 후 image_id 첨부) ──
-  if (msg.kind === 'writePost') {
+  // 게시글 추천/비추천 (앱과 동일 엔드포인트 → 서버가 토글/취소 규칙을 동일하게 적용)
+  if (msg.kind === 'vote') {
     (async () => {
-      let image_id = '', image_format = '';
-      if (p.image) {
-        const up = await uploadImage(p.image, p.is_gif);
-        if (up.ok) { image_id = up.image_id; image_format = up.image_format; await registerPending(image_id, image_format); }
-        else console.log('[cth-bg] writePost image upload failed:', up.error);
-      }
-      const body = { request_id: p.request_id, title: p.title || '', body: p.body || '', youtube_url: p.youtube_url || '' };
-      // LegacyPostCreate(OpenAPI): 업로드 이미지를 image_id + image_format 로 첨부. (additionalProperties 금지)
-      if (image_id) { body.image_id = image_id; body.image_format = image_format; }
-      const r = await authedFetch(`${LOLAPI_BASE}/board/legacy-write/posts`, { method: 'POST', body: JSON.stringify(body) }, { 'Content-Type': 'application/json' });
+      const body = { action: p.action === 'down' ? 'down' : 'up' };   // LegacyPostVote: action ∈ {up,down}
+      const r = await authedFetch(`${LOLAPI_BASE}/board/legacy-write/posts/${enc(p.post_seq)}/vote`,
+        { method: 'POST', body: JSON.stringify(body) }, { 'Content-Type': 'application/json' });
       const data = await r.json().catch(() => null);
-      sendResponse({ ok: r.status >= 200 && r.status < 300, status: r.status, data, image_ok: !p.image || !!image_id });
+      sendResponse({ ok: r.status >= 200 && r.status < 300, status: r.status, data });
     })().catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
     return true;
   }
 
-  // ── 댓글쓰기 (legacy-write: 구 저장소에 기록 → 앱에도 보임. Bearer 인증, 레거시 post_seq 사용) ──
+
+
+  // ── 글쓰기 (원본 유지가 필요한 이미지(WebP)가 첨부된 경우에만 확장이 처리) ──
+  //    사이트와 동일 순서: 이미지 업로드 → pending 등록 → 글 작성
+  if (msg.kind === 'writePost') {
+    (async () => {
+      let image_id = '', image_format = '', image_error = '';
+      if (p.image) {
+        const up = await uploadImage(p.image, p.image_format);
+        if (up.ok) { image_id = up.image_id; image_format = up.image_format; await registerPending(image_id, image_format); }
+        else { image_error = up.error || 'unknown'; console.log('[cth-bg] writePost image upload failed:', image_error); }
+      }
+      const body = {
+        title: p.title || '',
+        body: p.body || '',
+        youtube_url: p.youtube_url || '',
+        image_id: image_id,
+        image_format: image_format,
+        notice: false,
+        request_id: p.request_id
+      };
+      const r = await authedFetch(`${LOLAPI_BASE}/board/legacy-write/posts`,
+        { method: 'POST', body: JSON.stringify(body) }, { 'Content-Type': 'application/json' });
+      const data = await r.json().catch(() => null);
+      console.log('[cth-bg] writePost', r.status, data);
+      sendResponse({ ok: r.status >= 200 && r.status < 300, status: r.status, data,
+        image_ok: !p.image || !!image_id, image_error: image_error });
+    })().catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
+    return true;
+  }
+
+  // ── 답글 작성 (사이트는 parent_id 를 0 으로 고정해 보내므로 답글만 확장이 처리) ──
+  //    사이트와 동일 순서: 이미지 업로드 → pending 등록 → 댓글 작성(parent_id 포함)
   if (msg.kind === 'writeComment') {
     (async () => {
-      let image_id = '', image_format = '';
+      let image_id = '', image_format = '', image_error = '';
       if (p.image) {
-        const up = await uploadImage(p.image, p.is_gif);
+        const up = await uploadImage(p.image, p.image_format);
         if (up.ok) { image_id = up.image_id; image_format = up.image_format; await registerPending(image_id, image_format); }
-        else console.log('[cth-bg] writeComment image upload failed:', up.error);
+        else { image_error = up.error || 'unknown'; console.log('[cth-bg] writeComment image upload failed:', image_error); }
       }
-      // LegacyCommentCreate(OpenAPI): image_id + image_format 로 첨부. (additionalProperties 금지)
-      const body = Object.assign({ request_id: p.request_id, body: p.body || '' },
-        p.parent_id ? { parent_id: p.parent_id } : {},
-        image_id ? { image_id: image_id, image_format: image_format } : {});
+      const body = {
+        body: p.body || '',
+        parent_id: Number(p.parent_id) || 0,
+        mention_user_id: '',
+        image_id: image_id,
+        image_format: image_format,
+        request_id: p.request_id
+      };
       const r = await authedFetch(`${LOLAPI_BASE}/board/legacy-write/posts/${enc(p.post_seq)}/comments`,
         { method: 'POST', body: JSON.stringify(body) }, { 'Content-Type': 'application/json' });
       const data = await r.json().catch(() => null);
       console.log('[cth-bg] writeComment', r.status, data);
-      sendResponse({ ok: r.status >= 200 && r.status < 300, status: r.status, data, image_ok: !p.image || !!image_id });
+      sendResponse({ ok: r.status >= 200 && r.status < 300, status: r.status, data,
+        image_ok: !p.image || !!image_id, image_error: image_error });
     })().catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
     return true;
   }
 
-  // ── 내 글 삭제 (Bearer 인증, 소유자만. body: request_id) ──
-  if (msg.kind === 'deletePost') {
+  // ── 닉네임 변경 ──
+  //    사이트 경로는 서버가 일부 실패 코드만 처리해, 24시간 제한 같은 거부가 그대로 사라진다.
+  //    확장이 직접 호출해 서버 응답(상태·메시지)을 그대로 돌려주고 화면에 알린다.
+  if (msg.kind === 'changeNickname') {
     (async () => {
-      const r = await authedFetch(`${LOLAPI_BASE}/board/legacy-write/posts/${enc(p.post_seq)}/delete`,
-        { method: 'POST', body: JSON.stringify({ request_id: p.request_id }) }, { 'Content-Type': 'application/json' });
+      const meR = await authedFetch(`${LOLAPI_BASE}/users/me`, {});
+      const meJ = await meR.json().catch(() => null);
+      const u = (meJ && (meJ.user || meJ.data || meJ)) || {};
+      const localKey = u.local_user_key || p.local_user_key || '';
+      if (!localKey) { sendResponse({ ok: false, error: '프로필을 확인할 수 없습니다(로그인 필요)' }); return; }
+      // /users 는 전체 프로필을 덮어쓰므로 기존 값들을 함께 보낸다(닉네임만 교체)
+      const body = { local_user_key: localKey, nickname: p.nickname };
+      if (u.motto != null) body.motto = u.motto;
+      if (u.avatar_image_id) body.avatar_image_id = u.avatar_image_id;
+      if (u.fixed_image_id) body.fixed_image_id = u.fixed_image_id;
+      const r = await authedFetch(`${LOLAPI_BASE}/users`,
+        { method: 'POST', body: JSON.stringify(body) }, { 'Content-Type': 'application/json' });
       const data = await r.json().catch(() => null);
-      console.log('[cth-bg] deletePost', r.status, data);
+      console.log('[cth-bg] changeNickname', r.status, data);
+      // 200 이어도 본문이 실패를 알리는 경우가 있어 status 필드까지 확인한다
+      const okBody = !data || data.status == null || String(data.status).toUpperCase() === 'OK';
+      sendResponse({ ok: r.status >= 200 && r.status < 300 && okBody, status: r.status, data,
+                     nickname: (data && data.user && data.user.nickname) || '' });
+    })().catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
+    return true;
+  }
+
+  // ── 고정짤 설정/해제 ──
+  //    신 API 는 고정짤을 유저 프로필의 fixed_image_id 로 관리한다(사이트 changeIcon 과 동일 패턴).
+  //    등록: 이미지 업로드 → /users/images/pending → POST /users { ..., fixed_image_id }
+  //    해제: POST /users { ..., clear_fixed_image: true }
+  //    ※ /users 는 전체 프로필을 덮어쓰므로 기존 닉네임·모토·아바타를 함께 보내야 지워지지 않는다.
+  if (msg.kind === 'fixedImage') {
+    (async () => {
+      const meR = await authedFetch(`${LOLAPI_BASE}/users/me`, {});
+      const meJ = await meR.json().catch(() => null);
+      const u = (meJ && (meJ.user || meJ.data || meJ)) || {};
+      const localKey = u.local_user_key || p.local_user_key || '';
+      if (!localKey) { sendResponse({ ok: false, error: '프로필을 확인할 수 없습니다(로그인 필요)' }); return; }
+
+      const body = { local_user_key: localKey };
+      if (u.nickname) body.nickname = u.nickname;
+      if (u.motto != null) body.motto = u.motto;
+      if (u.avatar_image_id) body.avatar_image_id = u.avatar_image_id;
+
+      if (p.clear) {
+        body.clear_fixed_image = true;
+      } else {
+        const up = await uploadImage(p.image, 'jpg');   // 고정짤은 정지 이미지
+        if (!up.ok) { sendResponse({ ok: false, error: '이미지 업로드 실패: ' + up.error }); return; }
+        // 유저 이미지 pending 등록(게시판용과 엔드포인트가 다름)
+        await authedFetch(`${LOLAPI_BASE}/users/images/pending`,
+          { method: 'POST', body: JSON.stringify({ image_id: up.image_id }) },
+          { 'Content-Type': 'application/json' }).catch(() => null);
+        body.fixed_image_id = up.image_id;
+      }
+      const r = await authedFetch(`${LOLAPI_BASE}/users`,
+        { method: 'POST', body: JSON.stringify(body) }, { 'Content-Type': 'application/json' });
+      const data = await r.json().catch(() => null);
+      console.log('[cth-bg] fixedImage', p.clear ? 'clear' : 'set', r.status, data && data.status);
       sendResponse({ ok: r.status >= 200 && r.status < 300, status: r.status, data });
     })().catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
     return true;
   }
 
-  // ── 내 댓글 삭제 (Bearer 인증, 소유자만. body: request_id) ──
-  if (msg.kind === 'deleteComment') {
-    (async () => {
-      const r = await authedFetch(`${LOLAPI_BASE}/board/legacy-write/posts/${enc(p.post_seq)}/comments/${enc(p.comment_seq)}/delete`,
-        { method: 'POST', body: JSON.stringify({ request_id: p.request_id }) }, { 'Content-Type': 'application/json' });
-      const data = await r.json().catch(() => null);
-      console.log('[cth-bg] deleteComment', r.status, data);
-      sendResponse({ ok: r.status >= 200 && r.status < 300, status: r.status, data });
-    })().catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
+  // ── 차단 목록/해제 (앱 '내 정보 → 차단 관리'와 동일 엔드포인트) ──
+  //    목록: GET /blocks?local_user_key=...  → {results:[{id,nickname,avatar_url,created_at}], block_limit}
+  //    해제: POST /blocks {blocker_local_user_key, blocked_user_id, blocked:false}
+  if (msg.kind === 'blocks') {
+    respond(sendResponse, authedFetch(`${LOLAPI_BASE}/blocks?local_user_key=${enc(p.local_user_key || '')}`, {}));
     return true;
   }
-
-  // ── 차단 대상의 숫자 user id 조회 (구 post_seq → 모던 글 상세의 author.id) ──
+  // 차단 대상의 숫자 user id 조회 (구 post_seq → 신 글 상세의 author.id)
   if (msg.kind === 'authorNumId') {
     (async () => {
       const id = await resolveNewId(p.post_seq, p.author_id);
-      if (!id) { sendResponse({ ok: false, error: 'resolve failed' }); return; }
+      if (!id) { sendResponse({ ok: false, error: '글 정보를 확인하지 못했습니다.' }); return; }
       const r = await fetch(`${LOLAPI_BASE}/board/posts/${enc(id)}`, { headers: LOLAPI_HEADERS }).catch(() => null);
       const j = r && await r.json().catch(() => null);
-      const pp = (j && (j.post || j.data)) || j;
+      const pp = j && (j.post || j.data || j);
       const a = pp && pp.author;
       sendResponse(a && a.id != null
         ? { ok: true, author_id: a.id, nickname: a.nickname }
-        : { ok: false, error: 'no author id' });
+        : { ok: false, error: '작성자 정보를 확인하지 못했습니다.' });
     })().catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
     return true;
   }
-
-  // ── 유저 차단/해제 (POST /blocks. body: blocker_local_user_key, blocked_user_id(숫자), blocked) ──
   if (msg.kind === 'blockUser') {
-    respond(sendResponse, authedFetch(`${LOLAPI_BASE}/blocks`,
-      { method: 'POST', body: JSON.stringify({ blocker_local_user_key: p.local_user_key, blocked_user_id: Number(p.blocked_user_id), blocked: p.blocked !== false }) },
-      { 'Content-Type': 'application/json' }));
+    respond(sendResponse, authedFetch(`${LOLAPI_BASE}/blocks`, {
+      method: 'POST',
+      body: JSON.stringify({
+        blocker_local_user_key: p.local_user_key,
+        blocked_user_id: Number(p.blocked_user_id),
+        blocked: p.blocked === true            // 기본은 해제(false)
+      })
+    }, { 'Content-Type': 'application/json' }));
     return true;
   }
 
@@ -340,50 +444,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       { method: 'POST', body: JSON.stringify(body) }, { 'Content-Type': 'application/json' }));
     return true;
   }
-  if (msg.kind === 'memoNew') {
-    const body = { sender_local_user_key: p.local_user_key, sender_nickname: p.nickname || '', body: p.body || '' };
-    if (p.recipient_user_id) body.recipient_user_id = p.recipient_user_id;
-    else if (p.recipient_local_user_key) body.recipient_local_user_key = p.recipient_local_user_key;
-    respond(sendResponse, authedFetch(`${LOLAPI_BASE}/memos`,
-      { method: 'POST', body: JSON.stringify(body) }, { 'Content-Type': 'application/json' }));
-    return true;
-  }
 
-  // ── 읽기 (GET) — detail/comments 는 인증(Bearer) 첨부해 서버 is_mine(내 글/댓글) 을 받는다 ──
+  // ── 읽기 (GET) — 글 상세는 '내 추천 상태(vote)'를 얻기 위해서만 사용한다.
+  //    (목록·댓글 등 게시판 데이터는 DJ 사이트가 직접 가져오므로 확장은 조회하지 않는다)
   let url;
-  if (msg.kind === 'list') {
-    url = `${LOLAPI_BASE}/legacy-read-compat/posts?board=freeboard`
-        + `&limit=${enc(p.limit != null ? p.limit : 30)}`
-        + `&offset=${enc(p.offset != null ? p.offset : 0)}`;
-    if (p.q) url += `&q=${enc(p.q)}`;                    // 키워드 검색
-    if (p.nickname) url += `&nickname=${enc(p.nickname)}`; // 닉네임 검색 / 내 글
-    if (p.author_id) url += `&author_id=${enc(p.author_id)}`; // 작성자별 글
-    if (p.mode) url += `&mode=${enc(p.mode)}`;            // mode=popular → 인기글(추천순)
-  } else if (msg.kind === 'detail') {
+  if (msg.kind === 'detail') {
     url = `${LOLAPI_BASE}/legacy-read-compat/post?post_seq=${enc(p.post_seq)}`;
-  } else if (msg.kind === 'comments') {
-    url = `${LOLAPI_BASE}/legacy-read-compat/comments?post_seq=${enc(p.post_seq)}`;
-  } else if (msg.kind === 'commentsById') {
-    // 신 댓글 저장소(작성 댓글 포함 전체) — 구 post_seq를 신 id로 해석해 사용
-    url = `${LOLAPI_BASE}/board/posts/${enc(p.id)}/comments`;
-  } else if (msg.kind === 'blocks') {
-    // 차단 목록(내가 차단한 유저) — local_user_key만으로 조회(무인증). results:[{id,nickname,avatar_url}]
-    url = `${LOLAPI_BASE}/blocks?local_user_key=${enc(p.local_user_key)}`;
-  } else if (msg.kind === 'listModern') {
-    // 모던 목록 — 차단 숫자 id 매칭용(author 객체의 숫자 id + legacy_post_seq 로 레거시 목록과 조인).
-    url = `${LOLAPI_BASE}/board/posts?limit=${enc(p.limit != null ? p.limit : 30)}`;
-    if (p.q) url += `&q=${enc(p.q)}`;
-    if (p.nickname) url += `&nickname=${enc(p.nickname)}`;
-    if (p.mode) url += `&mode=${enc(p.mode)}`;
+    if (p.local_user_key) url += `&local_user_key=${enc(p.local_user_key)}`;   // 내 추천 상태(vote) 수신용
   } else {
     sendResponse({ ok: false, error: 'unknown kind: ' + msg.kind });
     return true;
   }
 
-  const readReq = (msg.kind === 'detail' || msg.kind === 'comments')
-    ? authedFetch(url, {})                       // 로그인 시 is_mine 을 받기 위해 Bearer 첨부
-    : fetch(url, { headers: LOLAPI_HEADERS });
-  readReq
+  authedFetch(url, {})                           // 로그인 시 vote 상태를 받기 위해 Bearer 첨부
     .then(r => r.json())
     .then(data => sendResponse({ ok: true, data }))
     .catch(err => sendResponse({ ok: false, error: String((err && err.message) || err) }));

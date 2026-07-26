@@ -1474,6 +1474,14 @@
       panel.classList.remove('cth-view-list', 'cth-view-detail', 'cth-view-write');
       panel.classList.add('cth-view-' + view);
     }
+    /* 글쓰기·아이콘 제작 완료 후 목록으로 돌아갈 때 사용.
+       완료 처리 과정에서 rpanel이 직전 글로 되돌아가며 제목이 바뀌는데,
+       그 사이 동안은 '글이 열렸다'는 자동 전환을 막아 목록에 머무르게 한다. */
+    let suppressAutoDetailUntil = 0;
+    function backToList(ms) {
+      suppressAutoDetailUntil = Date.now() + (ms || 3000);   // 서버 응답까지 넉넉히
+      setView('list');
+    }
 
     /* 영상 폭 계산에 쓰는 채팅창 실제 폭을 CSS 변수로 반영 */
     function updateVars() {
@@ -1512,11 +1520,20 @@
 
       /* rpanel에 글/스냅샷 내용이 실제로 로드되면(=제목 갱신) 목록 뷰에서 내용 뷰로 자동 전환.
          → 북마크/명예의전당 목록에서 글을 '우클릭'해 아카이브 스냅샷을 열 때도 정상 전환됨.
-         일반 목록 우클릭은 rpanel 내용을 로드하지 않으므로 목록 뷰가 그대로 유지된다. */
+         일반 목록 우클릭은 rpanel 내용을 로드하지 않으므로 목록 뷰가 그대로 유지된다.
+         단, 빈 상세(제목이 없거나 '글이 존재하지 않습니다.')로는 전환하지 않는다 —
+         게시판을 처음 열 때 사이트가 빈 상세를 한 번 렌더해, 목록 대신 그 화면이 뜨는 문제 방지. */
       const title = document.getElementById('lol_rpanel_header_title');
       if (title) {
         new MutationObserver(() => {
-          if (isCompact() && panel.classList.contains('cth-view-list')) setView('detail');
+          if (!isCompact() || !panel.classList.contains('cth-view-list')) return;
+          // 글쓰기·아이콘 제작을 끝내고 방금 목록으로 돌아온 직후에는 무시한다.
+          // (이때 rpanel이 직전에 보던 글로 되돌아가며 제목이 바뀌는데, 이를 '글 열림'으로
+          //  오인해 목록 대신 그 글이 다시 뜨는 문제가 있었다)
+          if (Date.now() < suppressAutoDetailUntil) return;
+          const t = (title.textContent || '').trim();
+          if (!t || t.indexOf('글이 존재하지 않습니다') !== -1) return;
+          setView('detail');
         }).observe(title, { childList: true, characterData: true, subtree: true });
       }
     }
@@ -1552,9 +1569,10 @@
     bindClick('lol_lpanel_write_button', () => setView('write'));                        // 글쓰기
     bindClick('lol_lpanel_userinfo_menu_button_icon_change', () => setView('detail'));   // 아이콘 제작(내용 영역 사용)
     bindClick('lol_write_cancel', () => setView('list'));
-    bindClick('lol_write_confirm', () => setTimeout(() => setView('list'), 0));
-    bindClick('lol_rpanel_body_icon_change_cancel', () => setView('list'));
-    bindClick('lol_rpanel_body_icon_change_confirm', () => setTimeout(() => setView('list'), 0));
+    bindClick('lol_write_confirm', () => setTimeout(() => backToList(), 0));
+    // 아이콘 '취소'는 사이트에서 선택한 이미지만 지우는 동작이므로 화면을 옮기지 않는다.
+    // (목록으로 나가려면 '← 목록' 버튼이나 내용 영역 우클릭을 쓰면 된다)
+    bindClick('lol_rpanel_body_icon_change_confirm', () => setTimeout(() => backToList(), 0));
 
     /* 옵션 적용/해제 */
     function apply(enabled) {

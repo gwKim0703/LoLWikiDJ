@@ -19,17 +19,6 @@ compactCheckbox.addEventListener('change', () => {
   chrome.storage.local.set({ cthCompactBoard: compactCheckbox.checked });
 });
 
-/* ── 자유게시판 신버전 대응 (신 서버 연동) ── */
-const newBoardCheckbox = document.getElementById('newBoardApi');
-
-chrome.storage.local.get('cthNewBoardApi', (data) => {
-  newBoardCheckbox.checked = data.cthNewBoardApi !== false; // 기본 ON
-});
-
-newBoardCheckbox.addEventListener('change', () => {
-  chrome.storage.local.set({ cthNewBoardApi: newBoardCheckbox.checked });
-});
-
 /* ── 새로고침·뒤로가기 이탈 확인창 ── */
 const unloadGuardCheckbox = document.getElementById('unloadGuard');
 

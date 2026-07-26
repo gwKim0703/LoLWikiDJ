@@ -10,16 +10,6 @@
   if (window.__cthLolRelayInstalled) return;
   window.__cthLolRelayInstalled = true;
 
-  /* 자유게시판 신버전 대응 on/off (팝업 설정 체크박스) 를 MAIN world 브리지에 전달.
-   * MAIN world는 chrome.storage에 접근 못 하므로 dataset 플래그로 넘긴다. 기본 ON. */
-  function applyNewBoardFlag(v) {
-    document.documentElement.dataset.cthNewBoard = (v === false) ? '0' : '1';
-  }
-  chrome.storage.local.get('cthNewBoardApi', (d) => applyNewBoardFlag(d.cthNewBoardApi));
-  chrome.storage.onChanged.addListener((ch, area) => {
-    if (area === 'local' && ch.cthNewBoardApi) applyNewBoardFlag(ch.cthNewBoardApi.newValue);
-  });
-
   window.addEventListener('cth-lolapi-req', (ev) => {
     let req;
     try { req = JSON.parse(ev.detail); } catch (e) { return; }

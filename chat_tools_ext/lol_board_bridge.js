@@ -1,18 +1,19 @@
 /* lol_board_bridge.js — MAIN world content script
  *
- * 자유게시판 백엔드가 2026-07-19 04:00:23에 신 REST API로 이전되면서,
- * DJ 서버가 중계하던 구 lolwiki.kr PHP 엔드포인트가 동결됨
- *  → 신규 글이 안 보이고 댓글이 사라지는 문제 발생.
+ * DJ 사이트가 자유게시판을 신 REST API에 직접 대응(서버 lolwiki-api.js)하면서,
+ * 확장이 게시판 데이터를 대신 가져오던 '신버전 대응'은 더 이상 필요하지 않다.
+ * 목록·글·댓글 조회와 글/댓글 작성(이미지 첨부 포함)·삭제·차단은 모두 사이트가 처리한다.
  *
- * 이 스크립트는 페이지의 socket.emit(자유게시판 요청)을 가로채,
- * DJ 서버 대신 신 API(https://lolwiki.kr/api/app/api/v1)에서 직접 읽어와
- * 서버가 만들던 것과 동일한 데이터 형태로 페이지의 렌더 함수를 호출한다.
- *  - fetch 자체는 CORS 우회를 위해 background(=relay 경유)에서 수행
- *  - 신 API는 이미지/아바타를 전체 https URL로 주는데, 구 렌더는 파일명→URL 조립이라
- *    렌더 직후 DOM에서 해당 <img> src를 실제 URL로 교체(fixup)한다.
+ * 이 스크립트에 남은 역할은 사이트가 아직 제공하지 않는 것들의 보강이다.
+ *  - 시각 표기: 렌더 직전에 목록 before / 댓글 reply_date 를 'N분 전 / HH:MM / 날짜'로 서식화
+ *  - 답글 표시: 사이트가 parent_id 를 데이터로만 주므로, 부모 아래 정렬 + 들여쓰기
+ *  - 상세 로딩 표시: 글 클릭 즉시 '불러오는 중…'(사이트 렌더가 끝나면 해제)
+ *  - 추천/비추천: 사이트는 추천만 지원 → 신 API로 비추천·토글까지 처리
+ *  - 알림센터(🔔): 사이트에 아직 없는 알림·쪽지 UI
+ *  - 프로필 아이콘 갱신: 다른 앱에서 아이콘을 바꿔도 즉시 반영
  *
- * 대상: lol_get_article_list(목록), lol_get_article_detail(글+댓글)  — 읽기 전용.
- * 글/댓글 작성(쓰기)은 신원 확보가 필요해 아직 미포함(추후).
+ * 인증은 사이트 로그인 창의 자격증명에 편승해 확장도 자체 토큰을 확보한다(별도 로그인 없음).
+ * 신 API 호출은 CORS 우회를 위해 background(=relay 경유)에서 수행한다.
  */
 (() => {
   if (window.__cthLolBoardBridge) return;
@@ -66,18 +67,35 @@
     const m = mirrorUrl(url);
     if (el.getAttribute('src') !== m) el.src = m;
   }
-  function fmtDateTime(iso) {
-    if (!iso) return '';
-    const m = /(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/.exec(iso);
-    return m ? (m[1] + ' ' + m[2]) : s(iso).slice(0, 16).replace('T', ' ');
+  /* 시각 문자열 파싱 → 절대시각(epoch) + KST 표시값.
+     서버가 오프셋 없이(KST naive) 주기도 하고 'Z'/'+00:00' 을 붙여 주기도 한다.
+     오프셋이 있으면 그대로 존중하고, 없을 때만 KST로 본다.
+     (오프셋을 무시하면 9시간이 어긋나 방금 쓴 글이 어제 날짜로 보인다) */
+  function parseTs(iso) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?\s*(Z|z|[+-]\d{2}:?\d{2})?/.exec(s(iso).trim());
+    if (!m) return null;
+    let tz = m[7] || '+09:00';
+    if (tz === 'z') tz = 'Z';
+    if (tz !== 'Z' && tz.indexOf(':') === -1) tz = tz.slice(0, 3) + ':' + tz.slice(3);   // +0900 → +09:00
+    const epoch = Date.parse(m[1] + '-' + m[2] + '-' + m[3] + 'T' + m[4] + ':' + m[5] + ':' + (m[6] || '00') + tz);
+    if (!isFinite(epoch)) return null;
+    const k = new Date(epoch + 9 * 3600 * 1000);       // 표시는 항상 KST 기준
+    const p2 = (n) => (n < 10 ? '0' + n : String(n));
+    const date = k.getUTCFullYear() + '-' + p2(k.getUTCMonth() + 1) + '-' + p2(k.getUTCDate());
+    const hm = p2(k.getUTCHours()) + ':' + p2(k.getUTCMinutes());
+    return { epoch: epoch, Y: k.getUTCFullYear(), Mo: k.getUTCMonth() + 1, D: k.getUTCDate(),
+             date: date, hm: hm, full: date + ' ' + hm + ':' + p2(k.getUTCSeconds()) };
   }
+
   // 목록/댓글 시간 표기:
-  //  · 1분 미만 → 'N초 전'
-  //  · 1분 이상 1시간 미만 → 'N분 전' (날짜가 달라도 우선)
-  //  · 1시간 이상 + 오늘(같은 날짜) → 'HH:MM' (24시간)
+  //  · 3초 이내 → 'now'
+  //  · 1분 미만 → 'N초전'
+  //  · 1시간 미만 → 'N분전'
+  //  · 12시간 미만 → 'N시간전'   (모두 날짜가 바뀌어도 경과시간 우선)
+  //  · 12시간 이상 + 오늘(같은 날짜) → 'HH:MM' (24시간)
   //  · 그 외 → 'YYYY-MM-DD'
-  // created_at 은 KST(UTC+9) naive 이므로 +09:00 로 절대시각 환산해 지금과 비교(브라우저 TZ 무관).
-  function fmtRelTime(iso) {
+  // withTitle=true 면 마우스를 올렸을 때 정확한 시각이 보이도록 title 속성을 붙인다.
+  function fmtRelTime(iso, withTitle) {
     // 타임스탬프 서식(작게 size=1). 경과 구간별로 색을 다르게 주며, DJ 사이트 테마(라이트/다크)에
     // 맞춰 색을 달리한다. 테마는 <html theme="default|dark"> 속성으로 판별(렌더 시점 기준).
     //   now(3초 이내)  라이트 #E53935 / 다크 #EF5350
@@ -91,37 +109,29 @@
     const C_SEC = dark ? '#CE93D8' : '#501C60';
     const C_MIN = dark ? '#964B53' : '#8C3A38';
     const C_DATE = '#B2B2B2';
+    const p = parseTs(iso);
+    const tip = (withTitle && p) ? ' title="' + nEsc(p.full) + '"' : '';
     const wrap = (t, color, bold) =>
-      '<font color=' + color + ' size=1>' + (bold ? '<b style="font-weight:800">' + t + '</b>' : t) + '</font>';
-    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/.exec(s(iso));
-    if (!m) return s(iso) ? wrap(s(iso).slice(0, 10), C_DATE, false) : '';
-    const Y = m[1], Mo = m[2], D = m[3], H = m[4], Mi = m[5], Sec = m[6] || '00';
-    const createdEpoch = Date.parse(Y + '-' + Mo + '-' + D + 'T' + H + ':' + Mi + ':' + Sec + '+09:00');
-    const diffSec = Math.floor((Date.now() - createdEpoch) / 1000);
+      '<font color=' + color + ' size=1' + tip + '>' + (bold ? '<b style="font-weight:800">' + t + '</b>' : t) + '</font>';
+    if (!p) return s(iso) ? wrap(s(iso).slice(0, 10), C_DATE, false) : '';
+    const diffSec = Math.floor((Date.now() - p.epoch) / 1000);
     const diffMin = Math.floor(diffSec / 60);
     if (diffSec <= 3) return wrap('now', C_NOW, true);              // 방금(3초 이내)
-    if (diffSec < 60) return wrap(diffSec + '초 전', C_SEC, true);
-    if (diffMin < 60) return wrap(diffMin + '분 전', C_MIN, true);
-    // 지금(KST) 날짜와 같은 날이면 시:분(분 전과 같은 색), 아니면 날짜(회색·보통)
+    if (diffSec < 60) return wrap(diffSec + '초전', C_SEC, true);
+    if (diffMin < 60) return wrap(diffMin + '분전', C_MIN, true);   // 날짜가 바뀌어도 1시간 미만이면 '분전'
+    const diffHour = Math.floor(diffMin / 60);
+    if (diffHour < 12) return wrap(diffHour + '시간전', C_MIN, true);  // 12시간까지는 날짜 대신 경과시간
+    // 12시간 이상: 지금(KST)과 같은 날이면 시:분, 아니면 날짜
     const nk = new Date(Date.now() + 9 * 3600 * 1000);
-    if (nk.getUTCFullYear() === +Y && (nk.getUTCMonth() + 1) === +Mo && nk.getUTCDate() === +D) {
-      return wrap(H + ':' + Mi, C_MIN, true);
+    if (nk.getUTCFullYear() === p.Y && (nk.getUTCMonth() + 1) === p.Mo && nk.getUTCDate() === p.D) {
+      return wrap(p.hm, C_MIN, true);
     }
-    return wrap(Y + '-' + Mo + '-' + D, C_DATE, false);   // 회색·보통
+    return wrap(p.date, C_DATE, false);   // 회색·보통
   }
-  // 사이트가 글 본문 끝에 붙이는 'DJ로 작성' 숨김 워터마크. 구 백엔드는 응답 시 제거했으나
-  // 신 API는 그대로 반환하므로 표시에서 떼어낸다.
-  function stripDjMarker(text) {
-    return text ? String(text).replace(/\s*<ㄹㅗㄹㄷㅣ>/g, '') : text;
-  }
-  function imageUrlsOf(p) {
-    if (Array.isArray(p.image_urls) && p.image_urls.length) return p.image_urls.slice(0, 4);
-    if (p.image_url) return [p.image_url];
-    return [];
-  }
-
-  // 글/댓글의 author_id 가 내 식별자(local_user_key/legacy_id/android/device 중 하나)와 일치하면 내 것.
-  // (legacy 계정은 author_id 가 legacy_id 형식이라 local_user_key 와 다름 → 여러 식별자를 모두 비교)
+  /* 글/댓글의 author_id 가 내 식별자 중 하나와 일치하면 내 것.
+     사이트 서버는 author_id 를 local_user_key 하고만 비교해서, 레거시 계정(author_id 가
+     legacy_id/UUID 형식)은 내 글인데도 my_post=0 으로 내려온다 → 삭제 버튼이 사라진다.
+     그래서 렌더 직전에 local_user_key·legacy_id·android/device id 를 모두 비교해 보정한다. */
   function isMyContent(authorId) {
     if (!authorId) return false;
     const ids = W.__cthMyIds || [];
@@ -129,145 +139,6 @@
     return false;
   }
 
-  /* ---------------- 차단(모바일 앱에서 차단한 유저) ----------------
-     신 API GET /blocks 는 {id(숫자 user id), nickname, avatar_url} 를 준다.
-     - 견고한 매칭은 '숫자 user id'. 하지만 게시판 표시는 legacy-read-compat(author_id=문자열)라
-       숫자 id가 없으므로, 모던 엔드포인트(/board/posts, /board/posts/{id}/comments)를 병렬로
-       보강해 각 글/댓글의 숫자 author id를 얻어 매칭한다(legacy_post_seq / comment_seq 로 조인).
-     - 조인이 불가한 항목(깊은 페이지·작성자별 목록 등)은 '닉네임'으로 폴백 매칭한다. */
-  let _blocksAt = 0, _blocksInFlight = null;
-  const CTH_LEGACY_CSEQ_OFFSET = 1000000000;   // legacy comment_seq = 모던 댓글 id + 10억
-  function isBlockedById(numId) {
-    const set = W.__cthBlockedIds;
-    return !!(set && set.size && numId != null && numId !== '' && set.has(String(numId)));
-  }
-  function isBlockedByNick(nick) {
-    const set = W.__cthBlockedNicks;
-    const n = s(nick).trim();
-    return !!(set && set.size && n && set.has(n));
-  }
-  // 숫자 id를 알면 그걸로만 판정(정확 — 동일 닉 다른 유저 오판 방지), 모르면 닉네임 폴백.
-  function isBlocked(numId, nick) {
-    if (numId != null && numId !== '') return isBlockedById(numId);
-    return isBlockedByNick(nick);
-  }
-  async function loadBlocks(force) {
-    const key = W.__cthLocalUserKey;
-    if (!key) { W.__cthBlockedIds = new Set(); W.__cthBlockedNicks = new Set(); return; }
-    const fresh = W.__cthBlockedIds && (Date.now() - _blocksAt < 30000);
-    if (!force && fresh) return;
-    if (_blocksInFlight) return _blocksInFlight;         // 동시 호출 합치기
-    _blocksInFlight = (async () => {
-      try {
-        const resp = await apiFetch('blocks', { local_user_key: key });
-        const ids = new Set(), nicks = new Set();
-        if (resp && resp.ok && resp.data && Array.isArray(resp.data.results)) {
-          for (const b of resp.data.results) {
-            if (b && b.id != null) ids.add(String(b.id));
-            const n = s(b && b.nickname).trim(); if (n) nicks.add(n);
-          }
-        }
-        W.__cthBlockedIds = ids; W.__cthBlockedNicks = nicks; _blocksAt = Date.now();
-      } catch (e) { /* 실패 시 이전 값 유지 */ } finally { _blocksInFlight = null; }
-    })();
-    return _blocksInFlight;
-  }
-  // 모던 목록에서 legacy_post_seq → 숫자 author id 맵을 만든다(조인 가능한 목록 모드에서만).
-  async function fetchPostAuthorIdMap(params) {
-    // 모던 /board/posts 는 q·nickname·mode 만 지원(author_id·offset 미지원) → 첫 페이지·검색·인기만 조인
-    if (params.author_id || (params.offset || 0) !== 0) return null;
-    try {
-      const mp = { limit: params.limit || 30 };
-      if (params.q) mp.q = params.q;
-      if (params.nickname) mp.nickname = params.nickname;
-      if (params.mode) mp.mode = params.mode;
-      const resp = await apiFetch('listModern', mp);
-      if (!resp || !resp.ok || !resp.data || !Array.isArray(resp.data.results)) return null;
-      const map = {};
-      for (const m of resp.data.results) {
-        const seq = m && m.legacy_post_seq, aid = m && m.author && m.author.id;
-        if (seq != null && aid != null) map[String(seq)] = String(aid);
-      }
-      return map;
-    } catch (e) { return null; }
-  }
-  // 모던 댓글에서 legacy comment_seq → 숫자 author id 맵을 만든다.
-  async function fetchCommentAuthorIdMap(post, postSeq) {
-    try {
-      const modernId = await resolvePostId(post, postSeq);
-      if (!modernId) return null;
-      const resp = await apiFetch('commentsById', { id: modernId });
-      if (!resp || !resp.ok || !resp.data || !Array.isArray(resp.data.results)) return null;
-      const map = {};
-      for (const m of resp.data.results) {
-        if (m && m.id != null && m.author_id != null) map[String(m.id + CTH_LEGACY_CSEQ_OFFSET)] = String(m.author_id);
-      }
-      return map;
-    } catch (e) { return null; }
-  }
-
-  /* ---------------- 신 API → 구 클라이언트 데이터 매핑 ---------------- */
-  // 구 목록 아이템 형태(8080.js lol_get_article_list의 반환 형태)에 맞춘다.
-  function mapListItem(p) {
-    return {
-      post_seq: s(p.post_seq),
-      icon_img: '', badge_use: '',          // 아바타는 fixup으로 교체
-      post_title: s(p.title),
-      reply_cnt: p.comments || 0,
-      before: fmtRelTime(p.created_at),      // 목록 시간 표기(분 전 / HH:MM / 날짜)
-      post_date: s(p.created_at),
-      nickname: s(p.author),
-      views: p.views || 0,
-      likes: p.likes || 0,
-      alarm: p.report_count || 0,
-      youtube_url: s(p.youtube_url),
-      doodlr: 0,
-      pic_new: p.has_image ? '1' : '',       // 렌더는 length만 확인(짤 아이콘 표시용)
-      pic_multi: '',
-      fixedpic: '',
-      __cthAvatar: s(p.avatar_url),
-      __cthAuthorId: s(p.author_id)
-    };
-  }
-  // 구 상세 형태(lol_rpanel_update가 읽는 필드)
-  function mapDetail(p, replys, newId) {
-    return {
-      post_seq: s(p.post_seq),
-      post_title: s(p.title),
-      post_text: stripDjMarker(s(p.body)),
-      post_date: s(p.created_at),
-      likes: p.likes || 0,
-      views: p.views || 0,
-      nickname: s(p.author),
-      stack: s(p.author_stack_count),
-      youtube_url: s(p.youtube_url),
-      icon_img: '', badge_use: '',
-      pic_new: '', pic_multi: '', doodlr: 0, fixedpic: '',  // 이미지는 fixup
-      // 내 글이면 삭제 버튼 노출: 서버 is_mine 우선, 없으면 author_id를 내 식별자들과 비교. 사이트는 '1' 문자열 비교
-      my_post: (p.is_mine || isMyContent(s(p.author_id))) ? '1' : '',
-      replys: replys || [],
-      __cthOurs: true,                 // fixupDetail 이 우리 상세임을 판별 (아바타 없어도 장식 실행)
-      __cthAvatar: s(p.avatar_url),
-      __cthImages: imageUrlsOf(p),
-      __cthAuthorId: s(p.author_id),
-      __cthNewId: newId || null
-    };
-  }
-  // 신 댓글 엔드포인트(/board/posts/{id}/comments) 응답 → 구 reply 형태
-  function mapNewComment(c) {
-    const hidden = c.status && c.status !== 'active' && c.status !== 'normal' && c.status !== 'visible';
-    return {
-      reply_seq: s(c.id),
-      icon_img: '', badge_use: '',
-      nickname: s(c.nickname),
-      reply_date: fmtRelTime(c.created_at),
-      my_post: 0,
-      reply_img: c.image_url ? '1' : '',
-      reply_title: hidden ? '<i>삭제된 댓글입니다.</i>' : decorateMentions(stripDjMarker(s(c.body))),
-      __cthAvatar: s(c.avatar_url),
-      __cthImage: s(c.image_url)
-    };
-  }
   // 본문의 '@닉네임' 멘션을 파란 하이라이트 스팬으로 감싸 플레인 텍스트와 시각적으로 구분한다.
   // 나머지 본문은 그대로 두고(<,> 는 건너뛰어 기존 HTML을 깨지 않음) 멘션 토큰만 감싼다.
   // (댓글은 index_lol.js에서 text.innerHTML = reply_title 로 렌더되므로 스팬이 그대로 적용됨)
@@ -276,31 +147,20 @@
     return String(body).replace(/(^|[\s(])@([^\s@<>]{1,30})/g,
       function (m, pre, nick) { return pre + '<span class="cth-mention">@' + nick + '</span>'; });
   }
-  // 구 댓글 형태(lol_rpanel_update 댓글 렌더가 읽는 필드)
-  function mapReply(c) {
-    return {
-      reply_seq: s(c.comment_seq),
-      icon_img: '', badge_use: '',
-      nickname: s(c.author),
-      reply_date: fmtRelTime(c.created_at),
-      // 서버 is_mine 우선, 없으면 author_id를 내 식별자들과 비교(legacy_id 등)
-      my_post: (c.is_mine || isMyContent(s(c.author_id))) ? 1 : 0,
-      reply_img: c.image_url ? '1' : '',     // length만 확인 → 실제 src는 fixup
-      reply_title: c.deleted ? '<i>삭제된 댓글입니다.</i>' : decorateMentions(s(c.body)),
-      __cthAvatar: s(c.avatar_url),
-      __cthImage: s(c.image_url),
-      __cthParent: c.parent_id,             // 0/없음=일반 댓글, 그 외=답글 대상 comment_seq
-      __cthAuthorId: s(c.author_id)
-    };
-  }
 
-  /* ---------------- 답글(parent_id) 스레드 정렬 + 답글 작성 UI ---------------- */
+  /* ---------------- 시각 표기 후처리 + 답글 스레드 표시 ----------------
+     DJ 사이트가 신 API로 목록/글을 직접 가져오므로, 확장은 '렌더 직전'에 사이트 데이터의
+     시각 필드(목록 before / 댓글 reply_date, 형식 "YYYY-MM-DD HH:MM:SS")를 보기 좋은 서식으로
+     바꾸고, 댓글은 parent_id 로 부모 아래에 정렬해 렌더 후 들여쓰기를 입힌다.
+     (사이트는 parent_id 를 데이터로만 주고 계층 표시는 아직 하지 않는다) */
+  const RAW_TS = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/;   // 사이트가 주는 원본 시각 형식
+
   // 답글을 부모 댓글 바로 아래로 정렬하고 깊이(__cthDepth)를 매긴다.
   function threadReplies(arr) {
     const bySeq = {}, children = {}, roots = [];
     arr.forEach((r) => { bySeq[s(r.reply_seq)] = r; });
     arr.forEach((r) => {
-      const pid = r.__cthParent;
+      const pid = r.parent_id;
       if (pid && s(pid) !== '0' && bySeq[s(pid)]) (children[s(pid)] = children[s(pid)] || []).push(r);
       else roots.push(r);
     });
@@ -310,7 +170,88 @@
     })(roots, 0);
     return out;
   }
+  // 렌더 직전: 목록 항목의 시각 표기를 교체(사이트는 e['before'] 를 innerHTML 로 렌더).
+  function prepList() {
+    const list = W.g_lol_article_list;
+    if (!Array.isArray(list)) return;
+    for (const e of list) {
+      if (!e) continue;
+      // 원본 시각을 따로 보관하고 렌더할 때마다 다시 계산한다.
+      // (한 번만 바꾸면 페이지를 열어둔 채 시간이 흘러도 'N분전'이 그대로 멈춰 있게 된다)
+      // 앞뒤 공백을 먼저 털어낸다 — 공백이 섞이면 서식화를 건너뛰어 '공백+날짜'가 그대로 보였다.
+      if (e.__cthRaw == null) { const raw = s(e.before).trim(); if (RAW_TS.test(raw)) e.__cthRaw = raw; }
+      if (e.__cthRaw) e.before = fmtRelTime(e.__cthRaw, true);
+    }
+  }
+  /* 렌더 직후: 목록에서 시간(=[spec])의 글자 시작점을 제목([title])과 맞춘다.
+     두 요소의 박스 위치·여백은 같은데도 글자는 한 칸 밀려 보인다(글꼴/글자 크기에 따른
+     좌측 여백 차이). 그래서 실제로 그려진 첫 글자의 좌표를 재서 차이만큼 보정한다. */
+  function firstGlyphLeft(el) {
+    try {
+      const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      let n;
+      while ((n = w.nextNode())) { if (n.nodeValue && n.nodeValue.trim()) break; }
+      if (!n) return NaN;
+      const i = n.nodeValue.search(/\S/);                 // 첫 '보이는' 글자
+      const r = document.createRange();
+      r.setStart(n, i); r.setEnd(n, i + 1);
+      const rect = r.getBoundingClientRect();
+      return (rect.width || rect.height) ? rect.left : NaN;
+    } catch (e) { return NaN; }
+  }
+  function alignListSpec() {
+    const board = document.getElementById('lol_lpanel_board');
+    if (!board) return;
+    for (const item of board.querySelectorAll('.lol_article_list_item')) {
+      const sp = item.querySelector('[spec]');
+      if (!sp || sp.__cthAligned) continue;
+      sp.__cthAligned = 1;
+      // (1) 맨 앞 텍스트의 선행 공백 제거(태그 안쪽에 있어도 잡히도록 첫 텍스트 노드를 찾는다)
+      try {
+        const w = document.createTreeWalker(sp, NodeFilter.SHOW_TEXT);
+        const t = w.nextNode();
+        if (t && /^\s/.test(t.nodeValue)) t.nodeValue = t.nodeValue.replace(/^\s+/, '');
+      } catch (e) {}
+      // (2) 실제 글자 시작 좌표를 재서 제목과 어긋난 만큼 좌측 여백으로 보정
+      const ti = item.querySelector('[title]');
+      if (!ti) continue;
+      const tl = firstGlyphLeft(ti), sl = firstGlyphLeft(sp);
+      if (!isFinite(tl) || !isFinite(sl)) continue;
+      const diff = sl - tl;
+      if (Math.abs(diff) < 0.5) continue;                  // 이미 맞으면 건드리지 않음
+      const cur = parseFloat(getComputedStyle(sp).marginLeft) || 0;
+      sp.style.marginLeft = (cur - diff) + 'px';
+    }
+  }
 
+  // 렌더 직전: 댓글 시각·멘션 표기 교체 + 답글을 부모 아래로 정렬.
+  let _prepSeq = '';
+  function prepDetail() {
+    const d = W.g_lol_current_detail;
+    if (!d) return;
+    if (s(d.post_seq) !== _prepSeq) {      // 다른 글로 이동하면 답글 대상 초기화
+      _prepSeq = s(d.post_seq);
+      if (cthReply.parent_id) { cthReply.parent_id = null; cthReply.nick = ''; }
+    }
+    // 내 글 판정 보정 → 사이트의 '삭제' 버튼이 다시 표시된다(사이트는 '1' 문자열로 비교)
+    if (d.my_post !== '1' && isMyContent(s(d.author_id))) d.my_post = '1';
+    if (!Array.isArray(d.replys)) return;
+    for (const r of d.replys) {
+      if (!r) continue;
+      if (r.my_post != 1 && isMyContent(s(r.author_id))) r.my_post = 1;   // 내 댓글 삭제 버튼
+      // 시각: 원본을 보관하고 렌더마다 다시 계산(마우스를 올리면 정확한 시각 표시)
+      // 목록과 마찬가지로 앞뒤 공백을 털어낸 뒤 판별한다.
+      if (r.__cthRaw == null) { const raw = s(r.reply_date).trim(); if (RAW_TS.test(raw)) r.__cthRaw = raw; }
+      if (r.__cthRaw) r.reply_date = fmtRelTime(r.__cthRaw, true);
+      // 멘션 강조는 시간과 무관하므로 한 번만
+      if (!r.__cthMent) { if (r.reply_title) r.reply_title = decorateMentions(s(r.reply_title)); r.__cthMent = 1; }
+    }
+    d.replys = threadReplies(d.replys);
+  }
+  /* ---------------- 답글 작성 UI ----------------
+     사이트는 댓글 작성 시 parent_id 를 0 으로 고정해 보내므로(=답글로 등록되지 않음),
+     '답글' 대상이 지정된 경우에만 확장이 작성을 가로채 parent_id 와 함께 보낸다.
+     일반 댓글은 그대로 사이트가 처리한다(둘 다 이미지 첨부 정상). */
   const cthReply = { parent_id: null, nick: '' };   // 현재 답글 대상
   function setReplyTarget(seq, nick) {
     cthReply.parent_id = seq; cthReply.nick = nick || '';
@@ -324,7 +265,7 @@
   }
   // 입력창(write container)을 사이트가 named-global로 참조하므로, 리스트 안에 넣어둔 채로
   // 사이트 렌더(리스트 removeChild)가 돌면 요소가 분리되어 깨진다. 따라서 렌더 전에는 항상
-  // restoreWriteToBottom()으로 맨 아래(원위치)에 두고, 렌더 후에만 이 함수로 대상 아래로 옮긴다.
+  // 맨 아래(원위치)에 두고, 렌더 후에만 대상 아래로 옮긴다.
   function restoreWriteToBottom() {
     const cont = document.getElementById('lol_rpanel_reply_board_write_container');
     const board = document.getElementById('lol_rpanel_reply_board');
@@ -338,8 +279,8 @@
       const key = String(cthReply.parent_id).replace(/["\\]/g, '\\$&');
       const item = rlist && rlist.querySelector('.lol_reply_list_item[seq="' + key + '"]');
       if (item) item.after(cont);        // 대상 댓글 바로 아래로 이동
-      else restoreWriteToBottom();       // 대상 항목을 못 찾으면 맨 아래에서라도
-      showReplyBar();                    // 어느 경우든 답글 바 표시(대상 명시)
+      else restoreWriteToBottom();
+      showReplyBar();
     } else {
       restoreWriteToBottom();
       const bar = document.getElementById('cth-board-reply-bar'); if (bar) bar.remove();
@@ -348,22 +289,19 @@
   function showReplyBar() {
     const cont = document.getElementById('lol_rpanel_reply_board_write_container');
     if (!cont || !cont.parentElement) return;
-    // ID/클래스는 content.js 채팅 답장 UI('cth-reply-bar'/'cth-reply-cancel')와 충돌하지 않게 'cth-board-' 접두
+    // ID/클래스는 content.js 채팅 답장 UI('cth-reply-bar')와 충돌하지 않게 'cth-board-' 접두
     let bar = document.getElementById('cth-board-reply-bar');
     if (!bar) bar = document.createElement('div');
     bar.id = 'cth-board-reply-bar';
-    // 바를 항상 입력창 바로 앞(=대상 댓글과 입력창 사이)에 위치시킨다
     cont.parentElement.insertBefore(bar, cont);
-    // cssText로 매번 재설정(다른 스타일시트 규칙에 눌리지 않도록 display도 명시)
     bar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 10px;font-size:12px;color:#ccc;background:rgba(51,154,240,.13);border-radius:6px;margin:0 5px 4px';
     bar.innerHTML = '<span>↳ <b>' + nEsc(cthReply.nick) + '</b> 님에게 답글</span>' +
       '<span id="cth-board-reply-cancel" style="cursor:pointer;color:#e03131;font-weight:bold">✕ 취소</span>';
     const cancel = document.getElementById('cth-board-reply-cancel'); if (cancel) cancel.onclick = clearReplyTarget;
   }
-  // 신모드에서 렌더된 모든 댓글에 '답글' 버튼(+ 스레드 들여쓰기)을 주입.
-  // __cthOurs 게이트와 무관하게 lol_rpanel_update 마다 항상 실행되므로 어떤 상태든 버튼이 유지된다.
+
+  // 렌더 직후: 답글 깊이만큼 들여쓰기 + 각 댓글에 '답글' 버튼 주입.
   function decorateAllReplies() {
-    if (document.documentElement.dataset.cthNewBoard === '0') return;
     const rlist = document.getElementById('lol_rpanel_reply_board_list');
     if (!rlist) return;
     const bySeq = {};
@@ -372,13 +310,13 @@
     for (const item of rlist.querySelectorAll('.lol_reply_list_item')) {
       const seq = item.getAttribute('seq');
       const r = bySeq[seq];
-      if (r) {   // 우리 데이터가 있으면 스레드 깊이만큼 들여쓰기
+      if (r) {
         const depth = Math.min(r.__cthDepth || 0, 4);
         item.style.marginLeft = (depth * 22) + 'px';
         if (depth > 0) { item.style.borderLeft = '2px solid var(--롤백_보더색)'; item.style.paddingLeft = '8px'; item.style.boxSizing = 'border-box'; }
       }
       const nc = item.querySelector('[nick_container]');
-      // 클래스명은 content.js의 채팅 답장 버튼 '.cth-reply-btn'(display:none)과 충돌하지 않게 별도로 사용
+      // 클래스명은 content.js의 채팅 답장 버튼 '.cth-reply-btn'(display:none)과 충돌하지 않게 별도 사용
       if (seq && nc && !nc.querySelector('.cth-board-reply-btn')) {
         const nickEl = item.querySelector('[nick]');
         const nick = nickEl ? nickEl.textContent : '';
@@ -394,136 +332,296 @@
     positionReplyWrite();
   }
 
-  /* ---------------- 렌더 직후 이미지/아바타 DOM 교정 ---------------- */
-  function fixupList() {
-    // 로그인한 내 계정 아이콘도 no-referrer로 교정 (신 API 아바타)
-    if (W.g_lol_user_info && W.g_lol_user_info.__cthAvatar) {
-      setImg(document.getElementById('lol_lpanel_account_icon'), W.g_lol_user_info.__cthAvatar);
+  /* ---------------- 댓글 애니메이션 이미지(GIF/WebP) 첨부 ----------------
+     사이트의 댓글 이미지 경로는 붙여넣은 이미지를 캔버스로 JPEG 변환(첫 프레임만)해 보내고
+     형식 정보도 보내지 않아, GIF/움직이는 WebP 를 붙여넣어도 정지 이미지가 된다.
+     (글쓰기 경로에는 원본 GIF 를 보관하는 처리가 있지만 WebP 는 거기서도 변환된다)
+     → 붙여넣는 순간 원본 바이트를 따로 보관해 두었다가, 등록할 때 확장이 원본 형식으로 올린다. */
+  const CTH_KEEP_FMT = { 'image/gif': 'gif', 'image/webp': 'webp' };   // 캔버스 변환 시 손상되는 형식
+  const cthOrig = { data: '', fmt: '' };
+  function installReplyGifCapture() {
+    const ph = document.getElementById('lol_rpanel_reply_board_write_image_placeholder');
+    if (ph && !ph.__cthGifHooked) {
+      ph.__cthGifHooked = true;
+      // 캡처 단계로 먼저 읽기만 하고 막지는 않는다(사이트의 미리보기 처리는 그대로 동작).
+      ph.addEventListener('paste', (e) => {
+        cthOrig.data = ''; cthOrig.fmt = '';
+        try {
+          const cd = e.clipboardData || W.clipboardData;
+          const f = cd && cd.files && cd.files[0];
+          const fmt = f && CTH_KEEP_FMT[f.type];
+          if (fmt) {
+            const fr = new FileReader();
+            fr.onload = () => { cthOrig.data = String(fr.result).split(',')[1] || ''; cthOrig.fmt = fmt; };
+            fr.readAsDataURL(f);
+          }
+        } catch (err) {}
+      }, true);
     }
-    const list = W.g_lol_article_list;
-    const board = document.getElementById('lol_lpanel_board_list');
-    if (!Array.isArray(list) || !board) return;
-    const bySeq = {};
-    for (const e of list) if (e && e.__cthAvatar) bySeq[s(e.post_seq)] = e.__cthAvatar;
-    for (const item of board.querySelectorAll('.lol_article_list_item')) {
-      const av = bySeq[item.getAttribute('seq')];
-      if (!av) continue;                     // 우리 데이터가 아닌 항목(북마크 등)은 건너뜀
-      setImg(item.querySelector('img[icon]'), av);
-    }
-  }
-  function fixupDetail() {
-    const d = W.g_lol_current_detail;
-    if (!d || !d.__cthOurs) return;          // 우리가 채운 상세일 때만 (아바타 유무와 무관)
-    // 내 글에는 '[차단하기]'(=자신 차단) 숨김
-    const bb = document.getElementById('lol_rpanel_header_button');
-    if (bb) bb.style.display = (d.my_post === '1') ? 'none' : '';
-    setImg(document.getElementById('lol_rpanel_header_icon'), d.__cthAvatar);
-    // #3 공유 버튼 아이콘: 사이트 렌더(lol_get_icon_url('') → 흰 이미지)를 덮어써
-    // 실제 글쓴이 아바타의 미러 URL로 지정한다. 채팅 공유 카드는 icon_img를
-    // lol_convert_uri_to_mirror(=https 통과)로 그대로 로드하므로 모두에게 정상 표시된다.
-    if (d.__cthAvatar) {
-      const shareBtn = document.getElementById('lol_rpanel_body_share_button');
-      if (shareBtn) shareBtn.setAttribute('icon_img', mirrorUrl(d.__cthAvatar));
-    }
-    // 본문 이미지 (최대 4칸)
-    const imgs = Array.isArray(d.__cthImages) ? d.__cthImages : [];
-    for (let k = 1; k <= 4; k++) {
-      const cont = document.getElementById('lol_rpanel_body_img' + k);
-      const im = document.getElementById('lol_rpanel_body_img' + k + '_img');
-      const add = document.getElementById('lol_rpanel_body_img' + k + '_add');
-      if (!cont || !im) continue;
-      if (k <= imgs.length) {
-        cont.style.display = 'block';
-        setImg(im, imgs[k - 1]);
-        if (add) add.setAttribute('src', mirrorUrl(imgs[k - 1]));
-      }
-      // k > imgs.length 인 칸은 렌더가 이미 숨김 처리함
-    }
-    // 댓글 아바타/이미지
-    const rlist = document.getElementById('lol_rpanel_reply_board_list');
-    if (rlist && Array.isArray(d.replys)) {
-      const bySeq = {};
-      for (const r of d.replys) if (r) bySeq[s(r.reply_seq)] = r;
-      for (const item of rlist.querySelectorAll('.lol_reply_list_item')) {
-        const r = bySeq[item.getAttribute('seq')];
-        if (!r) continue;
-        setImg(item.querySelector('img[icon]'), r.__cthAvatar);
-        if (r.__cthImage) setImg(item.querySelector('img[img]'), r.__cthImage);
-      }
+    // 첨부를 지우면 보관해둔 원본도 함께 버린다
+    if (typeof W.lol_clear_reply_image === 'function' && !W.lol_clear_reply_image.__cthWrapped) {
+      const orig = W.lol_clear_reply_image;
+      W.lol_clear_reply_image = function () { cthOrig.data = ''; cthOrig.fmt = ''; return orig.apply(this, arguments); };
+      W.lol_clear_reply_image.__cthWrapped = true;
     }
   }
 
-  /* ---------------- 요청 인터셉트 핸들러 ---------------- */
-  let _origEmit = null;
-
-  async function handleList(req) {
-    req = req || {};
-    const params = { limit: req.cnt || 30, offset: req.seq || 0 };
-    const aid = req.android_id;
-    if (typeof aid === 'string' && aid.indexOf('cth-author:') === 0) {
-      params.author_id = aid.slice('cth-author:'.length);       // 닉네임→작성자 글
-    } else if (req.mine) {
-      const nick = (W.g_lol_user_info && W.g_lol_user_info.nickname) || '';
-      if (nick) params.nickname = nick;                          // 내 글 (닉네임 필터)
-      else { _origEmit('lol_get_article_list', req); return; }
-    } else if (req.nick && req.nick.length) {
-      params.nickname = req.nick;                                 // 닉네임 검색
-    } else if (req.body && req.body.length) {
-      params.q = req.body;                                        // 키워드 검색
-    } else if (req.vote) {
-      params.mode = 'popular';                                    // 인기글(추천순)
+  /* 글쓰기 쪽도 같은 문제: 사이트는 GIF 만 원본을 보관하고 WebP 는 캔버스로 JPEG 변환한다.
+     붙여넣기·드래그 두 경로 모두에서 WebP 원본을 따로 보관해 두었다가 등록 시 그대로 올린다. */
+  const cthWriteOrig = { data: '', fmt: '' };
+  function keepWriteOriginal(file) {
+    cthWriteOrig.data = ''; cthWriteOrig.fmt = '';
+    const fmt = file && CTH_KEEP_FMT[file.type];
+    if (fmt !== 'webp') return;                    // GIF 는 사이트가 이미 원본을 보낸다
+    const fr = new FileReader();
+    fr.onload = () => { cthWriteOrig.data = String(fr.result).split(',')[1] || ''; cthWriteOrig.fmt = fmt; };
+    fr.readAsDataURL(file);
+  }
+  function installWriteWebpCapture() {
+    const ph = document.getElementById('lol_write_image_placeholder');
+    if (ph && !ph.__cthWebpHooked) {
+      ph.__cthWebpHooked = true;
+      ph.addEventListener('paste', (e) => {
+        try {
+          const cd = e.clipboardData || W.clipboardData;
+          keepWriteOriginal(cd && cd.files && cd.files[0]);
+        } catch (err) {}
+      }, true);
     }
-    const listP = apiFetch('list', params);
-    // 새 목록(offset 0 = 새로고침 버튼·최초 로드·검색 등)에서는 차단 목록을 강제 갱신 →
-    // 앱에서 차단/해제한 게 새로고침 시 바로 반영. 스크롤 페이지네이션(offset>0)은 캐시 유지.
-    await loadBlocks((req.seq || 0) === 0);
-    const hasBlocks = (W.__cthBlockedIds && W.__cthBlockedIds.size) || (W.__cthBlockedNicks && W.__cthBlockedNicks.size);
-    // 차단이 있을 때만 모던 목록으로 숫자 author id 맵을 보강(불필요한 요청 방지)
-    const postAuthorMap = hasBlocks ? await fetchPostAuthorIdMap(params) : null;
-    const resp = await listP;
-    if (!resp || !resp.ok || !resp.data || !Array.isArray(resp.data.results)) {
-      log('list fetch 실패, 서버 폴백', resp && resp.error);
-      _origEmit('lol_get_article_list', req);
+    // 드래그&드롭/파일선택 경로
+    if (typeof W.lol_write_image_ondrop === 'function' && !W.lol_write_image_ondrop.__cthWrapped) {
+      const orig = W.lol_write_image_ondrop;
+      W.lol_write_image_ondrop = function (e) {
+        try {
+          const files = (e && ((e.target && e.target.files) || (e.dataTransfer && e.dataTransfer.files))) || null;
+          keepWriteOriginal(files && files[0]);
+        } catch (err) {}
+        return orig.apply(this, arguments);
+      };
+      W.lol_write_image_ondrop.__cthWrapped = true;
+    }
+  }
+  // 글쓰기 등록(WebP 원본이 있을 때만 가로챔) — 나머지는 사이트가 그대로 처리
+  let _writingPost = false;
+  async function handleWritePost(data) {
+    data = data || {};
+    const image = cthWriteOrig.data;
+    if (!image || _writingPost) return;
+    if (!hasAuth()) {                                  // 인증이 없으면 사이트 기본 동작으로
+      try { _origEmit('lol_write', data); } catch (e) {}
+      cthWriteOrig.data = ''; cthWriteOrig.fmt = '';
       return;
     }
-    const rawResults = resp.data.results;
-    // 차단 유저의 글은 숨긴다: 모던 조인으로 얻은 숫자 id 우선, 없으면 닉네임 폴백.
-    // 표시만 제외하고 페이지 커서는 서버 반환 기준 유지.
-    const results = rawResults.filter(r => {
-      if (!r) return false;
-      const numId = postAuthorMap ? postAuthorMap[String(r.post_seq)] : undefined;
-      return !isBlocked(numId, r.author);
+    _writingPost = true;
+    const resp = await apiFetch('writePost', {
+      request_id: genReqId(), title: s(data.subject), body: s(data.body),
+      youtube_url: s(data.youtube_url), image: image, image_format: cthWriteOrig.fmt
     });
-    const mapped = results.map(mapListItem);
-    // offset=0 에서 API가 공지글을 맨 앞에 하나 더 얹어줘(limit+1개) 반환한다.
-    // 페이지네이션 커서는 '공지 제외' 개수만큼 전진시켜야 다음 페이지에서 글이 누락되지 않는다.
-    // (차단 필터로 화면 개수가 줄어도 커서는 서버가 실제 반환한 개수만큼 전진해야 페이지 누락이 없다)
-    const nonNotice = rawResults.filter(r => !r.notice).length;
-    W.g_lol_article_scroll_seq = (req.seq || 0) + nonNotice;
-    W.g_lol_article_list = (W.g_lol_article_list || []).concat(mapped);
-    W.lol_lpanel_update();                    // 래핑됨 → fixupList 자동 호출
-    const rf = document.getElementById('lol_lpanel_refresh'); if (rf) rf.style.height = '38px';
-    const sm = document.getElementById('lol_lpanel_search_menu'); if (sm) sm.style.display = 'none';
-    if (W.g_lol_lpanel_scroll_top_switch) {
-      W.g_lol_lpanel_scroll_top_switch = false;
-      const b = document.getElementById('lol_lpanel_board'); if (b) b.scroll(0, 0);
+    _writingPost = false;
+    cthWriteOrig.data = ''; cthWriteOrig.fmt = '';
+    if (resp && resp.ok) {
+      // 사이트의 lol_write 응답 처리와 동일하게 정리
+      try { W.lol_confirm_api_session(); } catch (e) {}
+      ['lol_write_subject', 'lol_write_body', 'lol_write_youtube'].forEach((id) => {
+        const el = document.getElementById(id); if (el) el.value = '';
+      });
+      try { W.lol_write_panel_toggle(false); } catch (e) {}
+      try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}
+      if (resp.image_ok === false) {
+        setTimeout(() => alert('글은 등록됐지만 이미지는 첨부되지 않았습니다.\n사유: ' + (resp.image_error || '알 수 없음')), 50);
+      }
+    } else {
+      const why = (resp && resp.data && (resp.data.detail || resp.data.message)) || (resp && (resp.status || resp.error)) || '오류';
+      alert('글 등록 실패: ' + why);
     }
   }
 
-  const _idCache = {};   // 구 post_seq → 신 post id
-  async function resolvePostId(post, postSeq) {
-    if (_idCache[postSeq]) return _idCache[postSeq];
-    const authorId = post && post.author_id;
-    if (!authorId) return null;
-    const rr = await apiFetch('resolveId', { author_id: authorId, post_seq: postSeq });
-    if (rr && rr.ok && rr.id) { _idCache[postSeq] = rr.id; return rr.id; }
-    return null;
+  /* ---------------- 닉네임 우클릭 → 그 작성자의 글 목록 ----------------
+     사이트의 '작성자 글 보기'는 서버가 mine=true 로 조회하는데, 이때 서버가 API 에
+     mode=mine 을 함께 보내면서 author_id 필터가 무시된다(=결과가 비어 목록이 뜨지 않음).
+       · author_id 만            → 정상
+       · mode=mine + author_id  → 0건
+     서버는 author_id 를 mine 일 때만 붙이므로 이 조합을 피할 수 없다.
+     → 대신 사이트가 정상 지원하는 '닉네임 검색' 경로로 같은 결과를 얻는다
+       (mode=latest + nickname → 그 작성자의 글만 조회됨). 조회는 그대로 사이트·서버가 수행. */
+  function handleOthers(postSeq) {
+    const d = W.g_lol_current_detail || {};
+    const nick = s(d.nickname).trim();
+    if (!nick) { try { _origEmit('lol_get_article_list_others', postSeq); } catch (e) {} return; }
+    W.g_lol_search_body = '';
+    W.g_lol_search_nick = nick;                      // 스크롤 추가 로딩에서도 필터 유지
+    W.g_lol_search_vote = false;
+    W.g_lol_search_mine = false;                     // mine 이면 서버가 mode=mine 을 붙여 결과가 비어버림
+    W.g_lol_is_award = false;
+    W.g_lol_article_scroll_seq = 0; W.g_lol_article_list = [];
+    W.g_lol_lpanel_scroll_top_switch = true;
+    W.g_lol_spec_android_id = W.g_lol_android_id;    // 작성자는 닉네임으로 거르므로 기본값(뷰어)
+    try { W.lol_get_article_list(0, 30, '', nick, false, false); } catch (e) {}
   }
 
+  // 댓글/답글 등록(사이트 emit 을 가로챈 경우) — 이미지(GIF 포함)도 함께 올린다.
+  function genReqId() {
+    return 'cth-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e9).toString(36);
+  }
+  let _writingReply = false;
+  async function handleCommentSubmit(data) {
+    data = data || {};
+    const postSeq = data.post_seq || (W.g_lol_current_detail && W.g_lol_current_detail.post_seq);
+    const parentId = cthReply.parent_id || 0;              // 0 이면 일반 댓글(= 원본 이미지 때문에 가로챈 경우)
+    const orig = cthOrig.data;                              // 있으면 캔버스 JPEG 대신 원본(GIF/WebP)을 보낸다
+    const image = orig || data.image || '';
+    if (!postSeq || _writingReply) return;
+    let body = s(data.body);
+    if (!body && !image) return;
+    const what = parentId ? '답글' : '댓글';
+    // 사이트 로그인 편승은 비동기라, 처음에는 인증이 아직 준비 중일 수 있다.
+    // 잠시 기다렸다가 그래도 없으면 사이트 기본 동작으로 넘긴다.
+    if (!hasAuth()) {
+      for (let i = 0; i < 25 && !hasAuth(); i++) await new Promise((r) => setTimeout(r, 200));
+      if (!hasAuth()) {
+        try { _origEmit('lol_write_reply', data); } catch (e) {}
+        clearReplyTarget(); cthOrig.data = ''; cthOrig.fmt = '';
+        setTimeout(() => alert('확장 인증이 준비되지 않아 사이트 기본 방식으로 등록했습니다.\n(답글·GIF는 다시 로그인한 뒤 이용해 주세요)'), 50);
+        return;
+      }
+    }
+    if (parentId && cthReply.nick) {                        // 답글이면 '@닉네임' 자동 삽입
+      const tag = '@' + cthReply.nick + ' ';
+      if (!body.startsWith(tag)) body = tag + body;
+    }
+    _writingReply = true;
+    const resp = await apiFetch('writeComment', {
+      post_seq: postSeq, parent_id: parentId, request_id: genReqId(),
+      body: body, image: image, image_format: (orig ? cthOrig.fmt : '')
+    });
+    _writingReply = false;
+    if (resp && resp.ok) {
+      clearReplyTarget(); cthOrig.data = ''; cthOrig.fmt = '';
+      const inp = document.getElementById('lol_rpanel_reply_board_input'); if (inp) inp.value = '';
+      try { W.lol_clear_reply_image(); } catch (e) {}
+      // 사이트가 댓글 목록을 다시 읽도록 상세를 재요청
+      try { _origEmit('lol_get_article_detail', { post_seq: postSeq, android_id: W.g_lol_android_id }); } catch (e) {}
+      if (image && resp.image_ok === false) {
+        log(what + ' 이미지 업로드 실패:', resp.image_error, '| 데이터 길이:', s(image).length);
+        setTimeout(() => alert(what + '은 등록됐지만 이미지는 첨부되지 않았습니다.\n사유: ' + (resp.image_error || '알 수 없음')), 50);
+      }
+    } else {
+      const why = (resp && resp.data && (resp.data.detail || resp.data.message)) || (resp && (resp.status || resp.error)) || '오류';
+      alert(what + ' 등록 실패: ' + why);
+    }
+  }
+
+  /* ---------------- 게시글 추천/비추천 ---------------- */
+  // 앱 규칙: 추천 0인 글은 비추천 불가(음수 방지), 1 이상이면 추천/비추천 모두 가능,
+  //          내가 한 추천/비추천은 같은 버튼을 다시 눌러 취소(서버가 토글). 앱과 동일 엔드포인트라 동작 일치.
+  function ensureVoteStyle() {
+    if (document.getElementById('cth-vote-style')) return;
+    const st = document.createElement('style'); st.id = 'cth-vote-style';
+    st.textContent = `
+      /* 추천 그래픽(like_frame.png, 100x67, flex 컬럼에서 align-self:center)의 바로 아래에
+         가운데 정렬된 '비추천' 버튼을 둔다. align-self:center 로 가로로 늘어나지 않게 한다. */
+      /* position:relative+z-index 필수: 추천 수(#..._like_count)가 position:relative,top:40px 로
+         버튼 위를 투명하게 덮는데, positioned 요소라 그냥 두면 count 가 위에 그려져 클릭을 가로채
+         (추천 버튼으로 버블링돼) 비추천이 오히려 추천이 된다. 버튼을 위로 올려 클릭이 닿게 한다. */
+      #cth-dislike{position:relative;z-index:5;align-self:center;display:inline-flex;align-items:center;
+        justify-content:center;gap:5px;margin:8px auto 2px;padding:5px 16px;border-radius:15px;
+        font-size:12px;font-weight:bold;line-height:1.4;white-space:nowrap;cursor:pointer;user-select:none;
+        border:1.5px solid;transition:opacity .12s,background .12s}
+      #cth-dislike:hover{opacity:.82}
+      #lol_rpanel_body_like.cth-voted{outline:3px solid #1c7ed6;outline-offset:2px;border-radius:10px}
+      #cth-dislike.cth-voted{color:#fff !important;background:#e03131 !important;border-color:#e03131 !important}
+      /* pointer-events:none 을 주면 안 된다 — 클릭이 버튼을 '통과'해 아래의 추천 버튼에 전달되어
+         비추천이 오히려 추천 +1 이 된다. 버튼이 클릭을 흡수하고 핸들러에서 무시해야 한다. */
+      #cth-dislike.cth-disabled{opacity:.35;cursor:default}
+      :root[theme="dark"] #cth-dislike{color:#ee8a8a;border-color:#8a4141;background:rgba(224,49,49,.10)}
+      :root[theme="default"] #cth-dislike{color:#c0392b;border-color:#e2a6a6;background:rgba(224,49,49,.06)}
+    `;
+    document.head.appendChild(st);
+  }
+  function renderVoteUI() {
+    const d = W.g_lol_current_detail; if (!d) return;
+    if (!hasAuth()) return;              // 확장 인증이 없으면 추천은 사이트 기본 동작에 맡긴다
+    const likeBox = document.getElementById('lol_rpanel_body_like');
+    const existingDown = document.getElementById('cth-dislike');
+    if (!likeBox || likeBox.style.display === 'none') {          // 추천 UI 숨김(글쓰기 등)이면 비추천도 숨김
+      if (existingDown) existingDown.style.display = 'none';
+      return;
+    }
+    ensureVoteStyle();
+    const likes = Number(d.likes) || 0;
+    const vote = d.__cthVote || 'neutral';
+    const cnt = document.getElementById('lol_rpanel_body_like_count');
+    if (cnt) { if (cnt.firstChild) cnt.firstChild.nodeValue = likes; else cnt.textContent = String(likes); }
+    likeBox.classList.toggle('cth-voted', vote === 'up');       // 내가 추천한 상태 강조
+    // 비추천 버튼 주입(추천 버튼 바로 옆)
+    let down = document.getElementById('cth-dislike');
+    if (!down) {
+      down = document.createElement('div');
+      down.id = 'cth-dislike'; down.className = 'no-drag'; down.title = '비추천 (추천 수를 내림 · 다시 누르면 취소)';
+      down.textContent = '▼ 비추천';
+      down.addEventListener('click', function (e) {
+        e.stopPropagation();
+        const cur = W.g_lol_current_detail;
+        if (cur) handleVote(cur.post_seq, 'down');
+      });
+      likeBox.parentNode.insertBefore(down, likeBox.nextSibling);
+    }
+    down.style.display = '';                                     // 숨김 상태였다면 다시 표시
+    down.classList.toggle('cth-voted', vote === 'down');
+    // 추천 0 & 내 비추천 아님 → 비추천 불가(앱과 동일). 클릭은 핸들러에서 무시한다.
+    down.classList.toggle('cth-disabled', likes <= 0 && vote !== 'down');
+  }
+  // 사이트 데이터에는 '내 추천 상태'가 없으므로, 글이 열릴 때 신 API 상세로 vote 상태만 받아온다.
+  let _voteStateSeq = '';
+  async function loadVoteState() {
+    const d = W.g_lol_current_detail;
+    if (!d || !hasAuth()) return;
+    const seq = s(d.post_seq);
+    if (!seq || seq === _voteStateSeq) return;      // 같은 글이면 재조회하지 않음
+    _voteStateSeq = seq;
+    const dr = await apiFetch('detail', { post_seq: seq, local_user_key: myKey() });
+    const cur = W.g_lol_current_detail;
+    if (dr && dr.ok && dr.data && dr.data.post && cur && s(cur.post_seq) === seq) {
+      cur.__cthVote = s(dr.data.post.vote) || 'neutral';
+      if (dr.data.post.likes != null) cur.likes = dr.data.post.likes;
+      renderVoteUI();
+    }
+  }
+  let _voting = false;
+  async function handleVote(postSeq, action) {
+    if (_voting) return;
+    if (!hasAuth()) return;                                                        // 확장 인증 없으면 처리 안 함
+    if (!W.g_lol_android_id || W.g_lol_android_id === W.g_lol_guest_id) return;   // 게스트 불가
+    const d = W.g_lol_current_detail;
+    if (!d || s(d.post_seq) !== s(postSeq)) return;
+    const likes = Number(d.likes) || 0;
+    if (action === 'down' && likes <= 0 && d.__cthVote !== 'down') return;         // 클라 규칙(음수 방지)
+    _voting = true;
+    try {
+      await apiFetch('vote', { post_seq: postSeq, action });
+      // 서버가 토글/취소/전환을 결정 → 상세를 다시 읽어 실제 likes/vote 를 반영(추정 없이 진실만 표시).
+      const dr = await apiFetch('detail', { post_seq: postSeq, local_user_key: myKey() });
+      const cur = W.g_lol_current_detail;
+      if (dr && dr.ok && dr.data && dr.data.post && cur && s(cur.post_seq) === s(postSeq)) {
+        cur.likes = dr.data.post.likes || 0;
+        cur.__cthVote = s(dr.data.post.vote) || 'neutral';
+        renderVoteUI();
+      }
+    } catch (e) { log('vote 실패', e); }
+    finally { _voting = false; }
+  }
+
+  /* ---------------- socket.emit 보강(가로채지 않고 곁들이는 처리) ---------------- */
+  let _origEmit = null;
+
   // 상세 로딩 표시(클릭 즉시 반응). 사이트 DOM을 건드리지 않도록 body에 고정 위치 오버레이로 띄운다.
+  // 응답이 오지 않는 경우에도 표시가 남지 않도록 안전 타이머로 자동 해제한다.
+  let _loadingTimer = 0;
   function showDetailLoading(on) {
     let el = document.getElementById('cth-detail-loading');
+    if (_loadingTimer) { clearTimeout(_loadingTimer); _loadingTimer = 0; }
     if (!on) { if (el) el.remove(); return; }
+    _loadingTimer = setTimeout(() => { const e2 = document.getElementById('cth-detail-loading'); if (e2) e2.remove(); }, 15000);
     const panel = document.getElementById('lol_rpanel');
     if (!panel) return;
     const r = panel.getBoundingClientRect();
@@ -536,357 +634,99 @@
             : 'background:rgba(255,255,255,.95);color:#333;box-shadow:0 2px 10px rgba(0,0,0,.18)');
   }
 
-  // 댓글 영역 전용 '댓글 불러오는 중…' 표시(본문 먼저 뜬 뒤 느린 댓글을 기다리는 동안).
-  function showCommentsLoading(on) {
-    let el = document.getElementById('cth-comments-loading');
-    if (!on) { if (el) el.remove(); return; }
-    const list = document.getElementById('lol_rpanel_reply_board_list');
-    if (!list) return;
-    if (!el) { el = document.createElement('div'); el.id = 'cth-comments-loading'; el.textContent = '댓글 불러오는 중…'; }
-    const dark = document.documentElement.getAttribute('theme') === 'dark';
-    el.style.cssText = 'padding:14px;text-align:center;font-size:12px;color:' + (dark ? '#aaa' : '#888');
-    list.appendChild(el);
-  }
-  const _delay = (ms) => new Promise((r) => setTimeout(r, ms));
-  // g_lol_current_detail 세팅 + 사이트 렌더(index_socket.js의 lol_article_detail 핸들러와 동일).
-  function applyDetail(mapped) {
-    const prev = W.g_lol_current_detail;
-    W.g_lol_same_article_prev = !!(prev && prev.post_seq == mapped.post_seq);
-    if (!W.g_lol_same_article_prev) clearReplyTarget();   // 다른 글로 이동할 때만 답글 대상 리셋
-    W.g_lol_current_detail = mapped;
-    try { W.lol_write_panel_toggle(false); } catch (e) {}
-    const rf = document.getElementById('lol_rpanel_refresh'); if (rf) rf.style.display = 'block';
-    W.lol_rpanel_update();                    // 래핑됨 → fixupDetail 자동 호출
-  }
-
-  let _detailToken = 0;                       // 상세 요청 세대 토큰(늦게 온 응답이 최신 화면을 덮지 않게)
-  async function handleDetail(req) {
-    req = req || {};
-    if (req.post_seq == null || s(req.post_seq).length === 0) return;
-    const token = ++_detailToken;
-    showDetailLoading(true);                   // 클릭 즉시 '불러오는 중…' 표시(수 초 무반응 체감 제거)
-    // 본문(제목/내용)과 댓글을 동시에 요청하되 서로를 기다리지 않는다.
-    // 옛 이미지 글은 서버가 '댓글'을 만드는 데 수 초 걸리기도 하므로(본문은 즉시), 본문을 먼저 띄운다.
-    const detailP = apiFetch('detail', { post_seq: req.post_seq });
-    // 댓글은 구 저장소(legacy-read-compat/comments)에서 읽는다 — 앱과 동일 저장소(legacy-write 댓글 포함).
-    const commentsP = apiFetch('comments', { post_seq: req.post_seq });
-
-    const dResp = await detailP;
-    if (token !== _detailToken) return;        // 그 사이 다른 글 클릭 → 폐기(최신 요청이 로딩 표시 소유)
-    if (!dResp || !dResp.ok || !dResp.data || !dResp.data.post) {
-      showDetailLoading(false);
-      log('detail fetch 실패, 서버 폴백', dResp && dResp.error);
-      _origEmit('lol_get_article_detail', req);
-      return;
-    }
-    const post = dResp.data.post;
-
-    // 댓글이 곧 오면(빠른 글) 본문·댓글을 한 번에 렌더(깜빡임 없음),
-    // 늦으면(느린 글) 본문을 먼저 렌더하고 댓글은 오는 대로 채운다.
-    let cr = await Promise.race([commentsP, _delay(350).then(() => '__slow__')]);
-    if (token !== _detailToken) return;
-    if (cr === '__slow__') {
-      applyDetail(mapDetail(post, []));        // 제목/내용 먼저 표시
-      showDetailLoading(false);
-      showCommentsLoading(true);               // 댓글 영역에만 '불러오는 중' 표시
-      cr = await commentsP;                     // 느린 댓글 계속 대기
-      if (token !== _detailToken) return;
-      showCommentsLoading(false);
-    }
-    await loadBlocks();   // 차단 목록 최신화(대개 목록 로드에서 캐시됨 → 즉시 반환)
-    const hasBlocks = (W.__cthBlockedIds && W.__cthBlockedIds.size) || (W.__cthBlockedNicks && W.__cthBlockedNicks.size);
-    // 차단이 있을 때만 모던 댓글로 숫자 author id 맵 보강 → 숫자 우선, 없으면 닉네임 폴백
-    const cmap = hasBlocks ? await fetchCommentAuthorIdMap(post, req.post_seq) : null;
-    if (token !== _detailToken) return;
-    const rawReplys = (cr && cr.ok && cr.data && Array.isArray(cr.data.results))
-      ? cr.data.results.filter(c => {
-          const numId = cmap ? cmap[String(c && c.comment_seq)] : undefined;
-          return !isBlocked(numId, c && c.author);
-        }).map(mapReply) : [];
-    applyDetail(mapDetail(post, threadReplies(rawReplys)));   // 최종 렌더(댓글 포함)
-    showDetailLoading(false);                  // 이미지는 이후 <img>가 비동기 로드(표시를 막지 않음)
-  }
-
-  // 닉네임 우클릭 → 그 작성자의 글 목록. author_id를 spec에 인코딩해 스크롤 페이지네이션에도 유지된다.
-  async function handleOthers(postSeq) {
-    const detail = W.g_lol_current_detail || {};
-    let authorId = detail.__cthAuthorId;
-    if (!authorId && postSeq != null) {
-      const dr = await apiFetch('detail', { post_seq: postSeq });
-      if (dr && dr.ok && dr.data && dr.data.post) authorId = s(dr.data.post.author_id);
-    }
-    if (!authorId) { _origEmit('lol_get_article_list_others', postSeq); return; }
-    // index_socket.js:665 핸들러 재현
-    W.g_lol_search_body = ''; W.g_lol_search_nick = ''; W.g_lol_search_vote = false;
-    W.g_lol_search_mine = true; W.g_lol_is_award = false;
-    W.g_lol_article_scroll_seq = 0; W.g_lol_article_list = [];
-    W.g_lol_lpanel_scroll_top_switch = true;
-    W.g_lol_spec_android_id = 'cth-author:' + authorId;
-    handleList({ seq: 0, cnt: 30, mine: true, android_id: 'cth-author:' + authorId });
-  }
-
-  /* ---------------- 글/댓글 쓰기 ---------------- */
-  function genReqId() {
-    return 'cth-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e9).toString(36);
-  }
-  function writeErr(resp) {
-    if (!resp) return '응답 없음';
-    if (resp.status === 401) return '로그인이 필요합니다(토큰 만료). 다시 로그인해 주세요.';
-    let d = resp.data && resp.data.detail;
-    if (Array.isArray(d)) d = d.map((e) => (e.loc ? e.loc.join('.') + ':' : '') + e.msg).join(', ');
-    return (resp.status ? ('HTTP ' + resp.status) : (resp.error || '실패')) + (d ? (' — ' + d) : '');
-  }
-
-  async function handleWritePost(data) {
-    data = data || {};
-    // 사이트(index_lol.js)가 본문 끝에 붙이는 '<ㄹㅗㄹㄷㅣ>' 워터마크를 신 API로 보내기 전에 제거.
-    // (구 백엔드는 응답 시 떼어냈지만 신 API는 그대로 저장·반환 → 앱에서 노출되므로 아예 저장 안 함)
-    const body = stripDjMarker(s(data.body));
-    if (!body) return;
-    const resp = await apiFetch('writePost', {
-      request_id: genReqId(), title: data.subject || '', body: body, youtube_url: data.youtube_url || '',
-      image: data.image || '', is_gif: !!data.is_gif
-    });
-    console.log('[cth-board] writePost:', resp);
-    if (resp && resp.ok) {
-      ['lol_write_subject', 'lol_write_body', 'lol_write_youtube'].forEach((id) => { const e = document.getElementById(id); if (e) e.value = ''; });
-      try { W.lol_write_panel_toggle(false); } catch (e) {}
-      try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}
-      if (data.image && resp.image_ok === false) setTimeout(() => alert('글은 등록됐지만 이미지는 첨부되지 않았습니다.\n이미지 첨부는 앱 전용 인증(서명)이 필요해 확장에서는 지원되지 않습니다. 이미지는 앱에서 올려주세요.'), 50);
-    } else {
-      alert('글 등록 실패: ' + writeErr(resp));
-    }
-  }
-
-  async function handleWriteComment(data) {
-    data = data || {};
-    if (!data.body) return;
-    const detail = W.g_lol_current_detail || {};
-    const postSeq = data.post_seq || detail.post_seq;
-    if (!postSeq) { alert('댓글 대상 글을 확인할 수 없습니다. 글을 다시 열어주세요.'); return; }
-    // legacy-write 경로(레거시 post_seq 그대로) → 구 저장소 기록 → 앱에도 보임. 신 id 해석 불필요.
-    // 답글 대상이 지정돼 있으면 parent_id 로 전송 → 답글로 등록.
-    const parentId = cthReply.parent_id ? Number(cthReply.parent_id) : undefined;
-    // 입력창엔 태그를 넣지 않으므로, 등록 시점에 '@닉네임 '을 본문 앞에 자동 삽입한다.
-    let body = data.body || '';
-    if (cthReply.parent_id && cthReply.nick) {
-      const tag = '@' + cthReply.nick + ' ';
-      if (!body.startsWith(tag)) body = tag + body;
-    }
-    const resp = await apiFetch('writeComment', { post_seq: postSeq, request_id: genReqId(), body: body, image: data.image || '', is_gif: !!data.is_gif, parent_id: parentId });
-    console.log('[cth-board] writeComment:', resp);
-    if (resp && resp.ok) {
-      clearReplyTarget();
-      const inp = document.getElementById('lol_rpanel_reply_board_input'); if (inp) inp.value = '';
-      await handleDetail({ post_seq: postSeq });   // 구 저장소 재조회 → 새 댓글(앱과 동일) 표시
-      const body = document.getElementById('lol_rpanel_body'); if (body) body.scroll(0, 99999999);
-      if (data.image && resp.image_ok === false) setTimeout(() => alert('댓글은 등록됐지만 이미지는 첨부되지 않았습니다.\n이미지 첨부는 앱 전용 인증(서명)이 필요해 확장에서는 지원되지 않습니다. 이미지는 앱에서 올려주세요.'), 50);
-    } else {
-      alert('댓글 등록 실패: ' + writeErr(resp));
-    }
-  }
-
-  /* 내 글 삭제 (사이트 lol_onclick_delete 가 confirm 후 lol_delete emit → 여기서 신 API 호출) */
-  async function handleDeletePost(data) {
-    const postSeq = (data && data.post_seq) || (W.g_lol_current_detail && W.g_lol_current_detail.post_seq);
-    if (!postSeq) return;
-    const resp = await apiFetch('deletePost', { post_seq: postSeq, request_id: genReqId() });
-    console.log('[cth-board] deletePost:', resp);
-    if (resp && resp.ok) {
-      try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}   // 목록 새로고침(삭제된 글 제외)
-      const back = document.getElementById('cth-board-back-detail'); // 컴팩트: 목록 뷰로 복귀
-      if (back) back.click();
-      setTimeout(() => alert('삭제 되었습니다.'), 30);
-    } else {
-      alert('글 삭제 실패: ' + writeErr(resp));
-    }
-  }
-
-  /* 유저 차단 (사이트 '[차단하기]' 버튼 lol_rpanel_header_button 클릭 → 신 API POST /blocks)
-     서버 차단 목록은 앱과 공유되므로, 여기서 차단하면 앱 차단 목록에도 반영된다. */
-  async function handleBlockUser() {
-    const d = W.g_lol_current_detail;
-    if (!d || d.post_seq == null || s(d.post_seq).length === 0) return;
-    const myKey = W.__cthLocalUserKey;
-    if (!myKey) { alert('로그인이 필요합니다.'); return; }
-    const nick = s(d.nickname);
-    const authorId = s(d.__cthAuthorId || d.author_id);
-    if (d.my_post === '1' || isMyContent(authorId)) { alert('자신은 차단할 수 없습니다.'); return; }
-    if (!W.confirm((nick || '이 사용자') + ' 님을 차단하시겠습니까?\n차단한 사용자의 글과 댓글은 보이지 않습니다.')) return;
-    // 차단엔 대상의 숫자 user id가 필요 → 모던 글 상세의 author.id 로 해석
-    const idr = await apiFetch('authorNumId', { post_seq: d.post_seq, author_id: authorId });
-    if (!idr || !idr.ok || idr.author_id == null) { alert('차단 대상 정보를 확인하지 못했습니다.'); return; }
-    const resp = await apiFetch('blockUser', { local_user_key: myKey, blocked_user_id: idr.author_id, blocked: true });
-    console.log('[cth-board] blockUser:', resp);
-    if (resp && resp.ok) {
-      // 로컬 차단 캐시 즉시 반영(재조회 없이 바로 숨김)
-      W.__cthBlockedIds = W.__cthBlockedIds || new Set(); W.__cthBlockedIds.add(String(idr.author_id));
-      if (nick) { W.__cthBlockedNicks = W.__cthBlockedNicks || new Set(); W.__cthBlockedNicks.add(nick.trim()); }
-      try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}   // 목록 새로고침(차단 글 제외)
-      const back = document.getElementById('cth-board-back-detail'); // 컴팩트: 목록 뷰로 복귀
-      if (back) back.click();
-      setTimeout(() => alert((nick || '사용자') + ' 님을 차단했습니다.'), 30);
-    } else {
-      alert('차단 실패: ' + writeErr(resp));
-    }
-  }
-  // 사이트가 index.js 에서 lol_rpanel_header_button.onclick = lol_onclick_auth_or_block(원본참조)로 바인딩.
-  // 그 버튼의 onclick 을 교체해, 신모드+로그인 상태면 차단을 수행하고, 그 외(게스트=로그인요청)엔 원본 호출.
-  function ensureBlockButtonBound() {
-    const btn = document.getElementById('lol_rpanel_header_button');
-    if (!btn || btn.__cthBlockBound) return;
-    btn.__cthBlockBound = true;
-    btn.onclick = function (e) {
-      if (document.documentElement.dataset.cthNewBoard !== '0'
-          && W.g_lol_android_id && W.g_lol_android_id !== W.g_lol_guest_id) {
-        if (e && e.preventDefault) e.preventDefault();
-        handleBlockUser();
-        return;
-      }
-      if (typeof W.lol_onclick_auth_or_block === 'function') return W.lol_onclick_auth_or_block.call(this, e);
-    };
-  }
-
-  /* 내 댓글 삭제 (사이트 lol_onclick_delete_reply → lol_delete_reply emit) */
-  async function handleDeleteComment(data) {
-    const postSeq = data && data.post_seq;
-    const replySeq = data && data.reply_seq;
-    if (!postSeq || !replySeq) return;
-    const resp = await apiFetch('deleteComment', { post_seq: postSeq, comment_seq: replySeq, request_id: genReqId() });
-    console.log('[cth-board] deleteComment:', resp);
-    if (resp && resp.ok) {
-      await handleDetail({ post_seq: postSeq });   // 갱신된 댓글 목록 재조회·표시
-    } else {
-      alert('댓글 삭제 실패: ' + writeErr(resp));
-    }
-  }
-
-  function cthLogout() {
-    apiFetch('logout', {});
-    W.g_lol_android_id = GUEST_ID;
-    W.g_lol_user_info = null;
-    W.__cthLocalUserKey = '';
-    W.__cthMyIds = [];
-    const wb = document.getElementById('lol_lpanel_write_button'); if (wb) wb.style.display = 'none';
-    try { W.lol_lpanel_update(); } catch (e) {}
-    try { W.lol_rpanel_update(); } catch (e) {}
-    log('로그아웃 처리 완료');
-  }
-
-  /* ---------------- 로그인 (계정코드 → ID/PW) ---------------- */
+  /* ---------------- 인증: DJ 사이트 로그인에 편승 ----------------
+     사이트가 자체 ID/PW 로그인으로 신 API를 쓰지만 토큰은 DJ 서버에만 있고 브라우저로 오지 않는다.
+     확장에 남은 기능(알림센터·추천/비추천·프로필 아이콘 갱신)도 신 API Bearer 인증이 필요하므로,
+     사이트 로그인 창에 입력된 자격증명을 그대로 재사용해 확장도 자체 토큰을 확보한다.
+     → 사용자는 사이트에 한 번만 로그인하면 되고, 확장 전용 로그인 창은 없다.
+     (이미 '세션 기억' 상태라 비밀번호가 비어 오면 다음 로그인 때 확보된다) */
   const GUEST_ID = 'LoLWikiDJ_Guest';
   function isGuest() {
     const id = W.g_lol_android_id;
     return !id || id === GUEST_ID || (typeof W.g_lol_guest_id !== 'undefined' && id === W.g_lol_guest_id);
   }
+  function hasAuth() { return !!W.__cthLocalUserKey; }
 
-  // 신 유저정보를 사이트 g_lol_user_info 형태로 매핑하고 로그인 상태로 전환
-  function applyLoggedIn(user, accountId) {
+  function cthLogout() {
+    apiFetch('logout', {});
+    W.__cthLocalUserKey = ''; W.__cthUserId = null; W.__cthMyIds = [];
+    _voteStateSeq = '';
+    try { refreshNotifBadge(); } catch (e) {}
+    log('확장 인증 해제');
+  }
+
+  // 로그인 시 저장된 프로필은 로그인 시점 값이라, 다른 앱에서 아이콘을 바꿔도 갱신되지 않는다.
+  // 목록 새로고침 때 GET /users/me 로 최신 아바타(및 닉네임/스택)를 받아와 좌측 상단 프로필을 즉시 교체한다.
+  async function refreshMyProfile() {
+    if (isGuest() || !W.g_lol_user_info || !hasAuth()) return;
+    let resp;
+    try { resp = await apiFetch('profile', {}); } catch (e) { return; }
+    const u = resp && resp.ok && resp.data && (resp.data.user || resp.data.data || resp.data);
+    if (!u || typeof u !== 'object') return;
+    mergeMyIds(u);                                               // 내 글 판정용 식별자 최신화
+    const info = W.g_lol_user_info; if (!info) return;
+    const newAvatar = u.avatar_url || u.avatar || u.icon_url || '';
+    if (newAvatar) info.__cthAvatar = newAvatar;                 // 이후 렌더에서도 최신값 사용
+    const newNick = u.nickname || u.name; if (newNick) info.nickname = newNick;
+    const st = (u.stack_count != null) ? u.stack_count : (u.point != null ? u.point : null);
+    if (st != null) info.point = st;
+    // 좌측 상단 아이콘 즉시 교체(변경된 이미지로)
+    if (newAvatar) setImg(document.getElementById('lol_lpanel_account_icon'), newAvatar);
+  }
+
+  // 내 글/댓글 판정용 식별자 모음. author_id 는 계정 종류에 따라 local_user_key 이거나
+  // legacy_id(UUID/hex) 라서, 알고 있는 식별자를 모두 모아 비교한다.
+  function mergeMyIds(user) {
+    const add = [user && user.local_user_key, user && user.legacy_id,
+                 user && user.legacy_android_id, user && user.legacy_device_id];
+    const set = new Set(W.__cthMyIds || []);
+    for (const v of add) if (v) set.add(String(v));
+    W.__cthMyIds = Array.from(set);
+  }
+
+  // 확장 자체 인증 상태만 기록한다(로그인 UI·사이트 상태는 모두 사이트가 관리).
+  function applyAuth(user) {
     user = user || {};
-    const nickname = user.nickname || user.name || accountId || '';
-    const stack = (user.stack_count != null) ? user.stack_count : ((user.point != null) ? user.point : (user.stack || 0));
-    const avatar = user.avatar_url || user.avatar || user.icon_url || '';
-    const uid = user.account_id || user.id || accountId || nickname || 'cth_user';
-    W.g_lol_android_id = String(uid);
-    W.__cthLocalUserKey = user.local_user_key || user.localUserKey || '';  // 쪽지 등 local_user_key 용도
+    W.__cthLocalUserKey = user.local_user_key || user.localUserKey || '';   // 알림/쪽지용
     W.__cthUserId = user.id || user.user_id || null;                        // 알림센터 채팅 좌/우 구분용
-    // 내 소유 판별용 식별자 모음 (author_id 는 legacy 계정이면 legacy_id 형식)
-    W.__cthMyIds = [user.local_user_key, user.legacy_id, user.legacy_android_id, user.legacy_device_id]
-      .filter(function (x) { return x; }).map(String);
-    W.g_lol_user_info = {
-      nickname: nickname, point: stack, iconpic: '', badge_use: '',
-      android_id: String(uid), __cthAvatar: avatar
-    };
-    const wb = document.getElementById('lol_lpanel_write_button'); if (wb) wb.style.display = 'block';
-    try { W.lol_lpanel_update(); } catch (e) {}
-    try { W.lol_rpanel_update(); } catch (e) {}
-    if (avatar) setImg(document.getElementById('lol_lpanel_account_icon'), avatar);
-    W.__cthBlockedIds = new Set(); W.__cthBlockedNicks = new Set(); _blocksAt = 0;   // 계정 전환 시 캐시 폐기
-    loadBlocks(true).catch(function () {});            // 새 계정의 차단 목록 선반영
-    log('로그인 상태 적용:', nickname);
+    W.__cthMyIds = [];
+    mergeMyIds(user);
+    log('확장 인증 준비됨:', user.nickname || user.name || '');
+    try { refreshNotifBadge(); } catch (e) {}
+    try { refreshMyProfile(); } catch (e) {}
   }
 
-  function closeLoginModal() {
-    const m = document.getElementById('cth-login-modal'); if (m) m.remove();
-  }
-  function showLoginModal() {
-    if (document.getElementById('cth-login-modal')) return;
-    if (!document.getElementById('cth-login-style')) {
-      const st = document.createElement('style'); st.id = 'cth-login-style';
-      st.textContent = `
-        #cth-login-modal{position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;font-family:'Segoe UI',sans-serif}
-        #cth-login-box{width:300px;background:#1e1e1e;color:#ddd;border:1px solid #444;border-radius:10px;padding:18px 18px 14px;box-shadow:0 8px 30px rgba(0,0,0,.5)}
-        #cth-login-box h4{margin:0 0 4px;font-size:15px;color:#fff}
-        #cth-login-box .cth-sub{font-size:11px;color:#888;margin-bottom:12px}
-        #cth-login-box input{width:100%;box-sizing:border-box;margin:5px 0;padding:9px 10px;background:#2a2a2a;border:1px solid #444;border-radius:6px;color:#eee;font-size:13px}
-        #cth-login-box input:focus{outline:none;border-color:#339af0}
-        #cth-login-box .cth-row{display:flex;gap:8px;margin-top:10px}
-        #cth-login-box button{flex:1;padding:9px 0;border:none;border-radius:6px;font-size:13px;cursor:pointer}
-        #cth-login-do{background:#1c7ed6;color:#fff}
-        #cth-login-cancel{background:#333;color:#ccc}
-        #cth-login-status{font-size:12px;color:#e03131;min-height:16px;margin-top:8px}
-      `;
-      document.head.appendChild(st);
-    }
-    const ov = document.createElement('div'); ov.id = 'cth-login-modal';
-    ov.innerHTML = `
-      <div id="cth-login-box">
-        <h4>자유게시판 로그인</h4>
-        <div class="cth-sub">롤백과사전 계정 (ID / 비밀번호)</div>
-        <input id="cth-login-id" type="text" placeholder="아이디" autocomplete="username">
-        <input id="cth-login-pw" type="password" placeholder="비밀번호" autocomplete="current-password">
-        <div id="cth-login-status"></div>
-        <div class="cth-row">
-          <button id="cth-login-do">로그인</button>
-          <button id="cth-login-cancel">취소</button>
-        </div>
-      </div>`;
-    document.body.appendChild(ov);
-    const idEl = ov.querySelector('#cth-login-id');
-    const pwEl = ov.querySelector('#cth-login-pw');
-    const statusEl = ov.querySelector('#cth-login-status');
-    ov.addEventListener('mousedown', (e) => { if (e.target === ov) closeLoginModal(); });
-    ov.querySelector('#cth-login-cancel').onclick = closeLoginModal;
-    const submit = () => doLogin(idEl.value.trim(), pwEl.value, statusEl);
-    ov.querySelector('#cth-login-do').onclick = submit;
-    pwEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
-    idEl.focus();
-  }
-
-  async function doLogin(accountId, password, statusEl) {
-    if (!accountId || !password) { statusEl.textContent = '아이디와 비밀번호를 입력하세요.'; return; }
-    statusEl.style.color = '#888'; statusEl.textContent = '로그인 중...';
+  // 사이트 로그인 창에 입력된 자격증명으로 확장도 신 API에 로그인해 자체 토큰을 확보
+  async function extLogin(accountId, password) {
+    if (!accountId || !password || hasAuth()) return;
     const resp = await apiFetch('login', { account_id: accountId, password: password });
-    console.log('[cth-board] login response:', resp);   // 응답 형태 확인용(테스트)
     if (resp && resp.ok) {
-      const user = (resp.auth && resp.auth.user) || (resp.data && (resp.data.user || (resp.data.data && resp.data.data.user))) || null;
-      applyLoggedIn(user, accountId);
-      closeLoginModal();
+      const user = (resp.auth && resp.auth.user)
+        || (resp.data && (resp.data.user || (resp.data.data && resp.data.data.user))) || null;
+      applyAuth(user);
     } else {
-      statusEl.style.color = '#e03131';
-      const why = resp && (resp.status ? ('HTTP ' + resp.status) : resp.error) || '실패';
-      statusEl.textContent = '로그인 실패: ' + why + ' (콘솔 확인)';
+      log('확장 인증 실패(사이트 로그인은 정상):', resp && (resp.status || resp.error));
     }
   }
 
   function installAuth() {
-    // 로그인 진입점 가로채기: 사이트가 '계정 코드' prompt를 띄우는 순간을 낚아채 ID/PW 모달로 대체.
-    // (onclick 바인딩 타이밍/재할당에 영향받지 않도록 window.prompt를 후킹)
-    if (!W.__cthPromptHooked) {
-      W.__cthPromptHooked = true;
-      const origPrompt = (typeof W.prompt === 'function') ? W.prompt.bind(W) : null;
-      W.prompt = function (message, def) {
-        if (document.documentElement.dataset.cthNewBoard !== '0' && isGuest()
-            && typeof message === 'string' && message.indexOf('계정 코드') !== -1) {
-          setTimeout(showLoginModal, 0);
-          return null; // 원래 계정코드 로그인 흐름은 취소하고 내 모달로 대체
-        }
-        return origPrompt ? origPrompt(message, def) : null;
+    // 사이트 로그인 흐름(lol_request_api_credentials)의 콜백을 감싸, 같은 자격증명으로 확장도 로그인
+    if (!W.__cthCredHooked && typeof W.lol_request_api_credentials === 'function') {
+      W.__cthCredHooked = true;
+      const orig = W.lol_request_api_credentials;
+      W.lol_request_api_credentials = function (callback) {
+        return orig.call(this, function (credentials) {
+          try {
+            if (credentials && credentials.account_id && credentials.password) {
+              extLogin(credentials.account_id, credentials.password);
+            }
+          } catch (e) {}
+          return callback(credentials);
+        });
       };
-      log('로그인(계정코드→ID/PW) 후킹 설치됨');
+      log('사이트 로그인 편승 후킹 설치됨');
     }
-    // 로그아웃: 사이트가 g_lol_android_id를 리셋하지 않아, confirm('...로그아웃...') 승인 시
-    // 저장 인증 삭제 + 게스트 상태로 리셋해야 실제로 로그아웃됨.
+    // 사이트 로그아웃 시 확장 인증도 함께 해제
     if (!W.__cthConfirmHooked) {
       W.__cthConfirmHooked = true;
       const origConfirm = (typeof W.confirm === 'function') ? W.confirm.bind(W) : null;
@@ -896,34 +736,53 @@
         return r;
       };
     }
-    // 페이지 로드 시 저장된 로그인 복원
+    // 페이지 로드 시 저장된 확장 인증(토큰) 복원
     if (!W.__cthAuthRestored) {
       W.__cthAuthRestored = true;
       apiFetch('authState', {}).then((resp) => {
-        if (resp && resp.ok && resp.auth && (resp.auth.user || resp.auth.token) && isGuest()) {
-          if (document.documentElement.dataset.cthNewBoard !== '0') applyLoggedIn(resp.auth.user, resp.auth.account_id);
-        }
+        if (resp && resp.ok && resp.auth && resp.auth.user) applyAuth(resp.auth.user);
       });
     }
   }
 
-  /* ---------------- 설치: 렌더 함수 래핑 + socket.emit 인터셉트 ---------------- */
+
+  /* ---------------- 설치: 렌더 함수 래핑 + socket.emit 인터셉트 ----------------
+     게시판 데이터는 이제 DJ 사이트가 신 API로 직접 가져오므로 가로채지 않는다.
+     확장은 렌더 '직전'에 사이트 데이터의 표기만 다듬고, 렌더 '직후'에 DOM을 보강한다. */
   function wrapRenderFns() {
     if (typeof W.lol_lpanel_update === 'function' && !W.lol_lpanel_update.__cthWrapped) {
       const orig = W.lol_lpanel_update;
-      W.lol_lpanel_update = function () { const r = orig.apply(this, arguments); try { fixupList(); } catch (e) {} return r; };
+      W.lol_lpanel_update = function () {
+        try { prepList(); } catch (e) {}                 // 목록 시각 표기 서식화
+        const r = orig.apply(this, arguments);
+        try { alignListSpec(); } catch (e) {}            // 시간 표기 시작점을 제목과 맞춤
+        // 사이트 렌더가 계정 아이콘을 되돌릴 수 있어, 갱신해둔 최신 아바타를 다시 적용
+        try {
+          const av = W.g_lol_user_info && W.g_lol_user_info.__cthAvatar;
+          if (av) setImg(document.getElementById('lol_lpanel_account_icon'), av);
+        } catch (e) {}
+        return r;
+      };
       W.lol_lpanel_update.__cthWrapped = true;
     }
     if (typeof W.lol_rpanel_update === 'function' && !W.lol_rpanel_update.__cthWrapped) {
       const orig = W.lol_rpanel_update;
       W.lol_rpanel_update = function () {
-        // 렌더가 리스트 자식을 removeChild로 비우므로, 입력창이 리스트 안에 있으면 분리되어 깨진다.
-        // 렌더 전에 항상 맨 아래(원위치)로 빼두고, 렌더 후 decorateAllReplies에서 대상 아래로 재이동.
+        try { prepDetail(); } catch (e) {}               // 댓글 시각·멘션 서식화 + 답글 정렬
+        // 렌더가 댓글 리스트를 removeChild로 비우므로, 입력창이 리스트 안에 있으면 분리되어 깨진다.
+        // 렌더 전에는 항상 원위치로 빼두고, 렌더 후 decorateAllReplies에서 대상 아래로 재이동.
         try { restoreWriteToBottom(); } catch (e) {}
         const r = orig.apply(this, arguments);
-        try { fixupDetail(); } catch (e) {}
-        try { decorateAllReplies(); } catch (e) {}
+        try { showDetailLoading(false); } catch (e) {}   // 글 내용이 떴으니 로딩 표시 해제
+        try { decorateAllReplies(); } catch (e) {}       // 답글 들여쓰기 + '답글' 버튼
+        try { renderVoteUI(); } catch (e) {}             // 추천/비추천 버튼·상태
+        try { loadVoteState(); } catch (e) {}            // 내 추천 상태 조회(글이 바뀐 경우만)
         try { ensureBlockButtonBound(); } catch (e) {}   // '[차단하기]' 버튼에 신 API 차단 연결
+        try {                                            // 내 글에는 '[차단하기]'(자기 차단) 숨김
+          const bb = document.getElementById('lol_rpanel_header_button');
+          const dd = W.g_lol_current_detail;
+          if (bb && dd && !isGuest()) bb.style.display = (dd.my_post === '1') ? 'none' : '';
+        } catch (e) {}
         return r;
       };
       W.lol_rpanel_update.__cthWrapped = true;
@@ -935,28 +794,42 @@
     if (!sock || typeof sock.emit !== 'function' || sock.emit.__cthWrapped) return !!(sock && sock.emit && sock.emit.__cthWrapped);
     _origEmit = sock.emit.bind(sock);
     const wrapped = function (event, ...args) {
-      // 팝업 '설정'의 체크박스로 켜고 끔 (relay가 dataset.cthNewBoard 세팅, 기본 ON)
-      const enabled = document.documentElement.dataset.cthNewBoard !== '0';
-      // 채팅으로 공유되는 img.lolwiki.kr 이미지는 Referer 핫링크 보호로 'BG.GG 안내' 이미지가 뜬다.
-      // 공유 메시지의 URL을 DJ 서버 미러(서버측에서 Referer 없이 대신 받아옴)로 치환하면,
-      // 메시지 자체에 미러 URL이 담겨 확장 없는 사람 포함 모두가 원본 이미지를 본다.
-      if (enabled && event === 'chat_message' && args[0] && typeof args[0].message === 'string'
-          && args[0].message.indexOf('img.lolwiki.kr') !== -1) {
-        args[0].message = args[0].message.replace(/https?:\/\/img\.lolwiki\.kr\/\S+/g,
-          function (u) { return W.location.origin + '/lolwiki_mirror/i?uri=' + encodeURIComponent(u); });
+      // 글을 클릭한 즉시 '불러오는 중…' 표시(요청은 사이트가 그대로 처리 → 렌더 시 해제)
+      if (event === 'lol_get_article_detail') { try { showDetailLoading(true); } catch (e) {} }
+      // 목록 새로고침(첫 페이지) 때 최신 프로필을 받아 좌측 상단 아이콘을 갱신
+      if (event === 'lol_get_article_list' && args[0] && !(args[0].seq > 0)) {
+        try { refreshMyProfile(); } catch (e) {}
       }
-      if (enabled && event === 'lol_get_article_list') { handleList(args[0]); return sock; }
-      if (enabled && event === 'lol_get_article_list_others') { handleOthers(args[0]); return sock; }
-      if (enabled && event === 'lol_get_article_detail') { handleDetail(args[0]); return sock; }
-      if (enabled && event === 'lol_write') { handleWritePost(args[0]); return sock; }
-      if (enabled && event === 'lol_write_reply') { handleWriteComment(args[0]); return sock; }
-      if (enabled && event === 'lol_delete') { handleDeletePost(args[0]); return sock; }
-      if (enabled && event === 'lol_delete_reply') { handleDeleteComment(args[0]); return sock; }
+      // 추천은 확장이 가로채 신 API로 처리(추천/비추천 토글 지원). 확장 인증이 없으면 사이트 기본 동작.
+      if (event === 'lol_like' && hasAuth()) { handleVote(args[0] && args[0].post_seq, 'up'); return sock; }
+      // 닉네임 우클릭(작성자 글 목록) — 서버 경로가 동결된 구 PHP라 확장이 대신 처리
+      if (event === 'lol_get_article_list_others') { handleOthers(args[0]); return sock; }
+      // 글쓰기: WebP 원본이 보관돼 있을 때만 가로챈다(사이트는 WebP 를 JPEG 로 변환해 버림)
+      if (event === 'lol_write' && cthWriteOrig.data) { handleWritePost(args[0]); return sock; }
+      // 답글이거나 GIF 가 첨부된 경우에만 가로챈다(그 외 일반 댓글은 사이트가 그대로 처리).
+      //  · 답글: 사이트는 parent_id 를 0 으로 고정해 보냄
+      //  · GIF: 사이트는 캔버스로 JPEG 변환해 보내 애니메이션이 사라짐
+      if (event === 'lol_write_reply' && (cthReply.parent_id || cthOrig.data)) {
+        handleCommentSubmit(args[0]); return sock;
+      }
       return _origEmit(event, ...args);
     };
     wrapped.__cthWrapped = true;
     sock.emit = wrapped;
-    log('socket.emit 인터셉트 설치됨');
+
+    // 글 삭제 후 화면 갱신: 사이트 핸들러는 alert('삭제 되었습니다.') 만 하고 아무것도 갱신하지 않아
+    // 확인을 눌러도 삭제된 글이 그대로 남아 보인다. 리스너를 하나 더 붙여(사이트 것 다음에 실행)
+    // 상세를 비우고 목록을 새로고침한다.
+    if (typeof sock.on === 'function') {
+      sock.on('lol_delete', function () {
+        try { W.g_lol_current_detail = {}; } catch (e) {}
+        try { W.lol_rpanel_update(); } catch (e) {}                  // 상세 → '글이 존재하지 않습니다.'
+        try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}   // 목록에서 제거
+        const back = document.getElementById('cth-board-back-detail'); // 컴팩트 모드: 목록 뷰로 복귀
+        if (back) back.click();
+      });
+    }
+    log('socket.emit 보강 설치됨(로딩 표시·프로필 갱신·추천 처리·삭제 후 갱신)');
     return true;
   }
 
@@ -964,14 +837,15 @@
   const cthN = { open: false, tab: 'notif', thread: null };
   function nEsc(t) { return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
   function nRel(iso) {
-    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(iso || '')); if (!m) return '';
-    const ep = Date.parse(m[1] + '-' + m[2] + '-' + m[3] + 'T' + m[4] + ':' + m[5] + ':' + (m[6] || '00') + '+09:00');
-    const sec = Math.floor((Date.now() - ep) / 1000), min = Math.floor(sec / 60);
+    const p = parseTs(iso); if (!p) return '';
+    const sec = Math.floor((Date.now() - p.epoch) / 1000), min = Math.floor(sec / 60);
     if (sec < 60) return Math.max(0, sec) + '초전';
     if (min < 60) return min + '분전';
+    const hour = Math.floor(min / 60);
+    if (hour < 12) return hour + '시간전';               // 목록/댓글 표기와 동일 규칙
     const nk = new Date(Date.now() + 9 * 3600 * 1000);
-    if (nk.getUTCFullYear() == +m[1] && nk.getUTCMonth() + 1 == +m[2] && nk.getUTCDate() == +m[3]) return m[4] + ':' + m[5];
-    return m[1] + '-' + m[2] + '-' + m[3];
+    if (nk.getUTCFullYear() === p.Y && nk.getUTCMonth() + 1 === p.Mo && nk.getUTCDate() === p.D) return p.hm;
+    return p.date;
   }
   function nHM(iso) { const m = /[T ](\d{2}):(\d{2})/.exec(String(iso || '')); return m ? (m[1] + ':' + m[2]) : ''; }
   function nDay(iso) { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || '')); return m ? (m[1] + '년 ' + (+m[2]) + '월 ' + (+m[3]) + '일') : ''; }
@@ -1080,7 +954,6 @@
   }
 
   function installNotificationCenter() {
-    if (document.documentElement.dataset.cthNewBoard === '0') return; // 신버전 모드에서만
     const header = document.getElementById('lol_lpanel_header');
     if (!header) return;
     // 쪽지함(구) 버튼 제거 — 알림센터로 대체
@@ -1115,7 +988,6 @@
     // content.js가 나중에 쪽지함 버튼을 추가해도 신모드에선 제거 (알림센터로 대체)
     const menuC = document.getElementById('lol_lpanel_userinfo_menu_inner_background');
     if (menuC) new MutationObserver(() => {
-      if (document.documentElement.dataset.cthNewBoard === '0') return;
       const b = document.getElementById('lol_lpanel_userinfo_menu_button_memo'); if (b) b.remove();
     }).observe(menuC, { childList: true });
 
@@ -1173,7 +1045,8 @@
   function openPostFromNotif(postSeq) {
     closeNotifPanel();
     try { if (!W.g_lol_panel_show) { W.g_lol_panel_show = true; W.lol_panel_update(); } } catch (e) {}
-    handleDetail({ post_seq: postSeq });
+    // 글 조회는 사이트가 처리한다(index_lol.js:389 와 동일한 요청)
+    try { W.socket.emit('lol_get_article_detail', { post_seq: postSeq, android_id: W.g_lol_android_id }); } catch (e) {}
   }
 
   /* ── 채팅(쪽지) 탭 ── */
@@ -1281,7 +1154,7 @@
     else { b.textContent = ''; b.classList.remove('show'); }
   }
   async function refreshNotifBadge() {
-    if (document.documentElement.dataset.cthNewBoard === '0' || !myKey()) return;
+    if (!myKey()) return;
     let total = 0;
     try {
       const nr = await apiFetch('notifs', {});
@@ -1294,12 +1167,358 @@
     else { b.classList.remove('show'); }
   }
 
+  /* ---------------- 고정짤 (내 글에 자동으로 붙는 이미지) ----------------
+     신 API 는 고정짤을 유저 프로필의 fixed_image_id 로 관리한다.
+     확장에서는 설정 메뉴에 '고정짤 등록/삭제'를 넣고, 등록 창에 이미지를 붙여넣기(Ctrl+V)하면
+     JPEG 로 변환해 업로드한다. */
+  function installFixedImageMenu() {
+    const menu = document.getElementById('lol_lpanel_userinfo_menu_inner_background');
+    if (!menu || document.getElementById('cth-fixedimg-set')) return;
+    // '아이콘 제작' 바로 아래에 오도록, 그 다음 버튼(차단목록) 앞에 끼워 넣는다.
+    const anchor = document.getElementById('lol_lpanel_userinfo_menu_button_blocklist_reset')
+      || document.getElementById('lol_lpanel_userinfo_menu_button_api_logout')
+      || document.getElementById('lol_lpanel_userinfo_menu_button_logout');
+    const mk = (id, text, onClick) => {
+      const b = document.createElement('div');
+      b.id = id; b.setAttribute('menu-button', ''); b.textContent = text;
+      b.addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        const m = document.getElementById('lol_lpanel_userinfo_menu'); if (m) m.style.display = 'none';
+        onClick();
+      });
+      if (anchor) menu.insertBefore(b, anchor); else menu.appendChild(b);
+      return b;
+    };
+    mk('cth-fixedimg-set', '고정짤 등록', showFixedImageModal);
+    mk('cth-fixedimg-del', '고정짤 삭제', clearFixedImage);
+  }
+
+  /* ---------------- 유저 차단 (글 상세의 '[차단하기]' 버튼) ----------------
+     사이트의 차단 버튼은 아직 미구현(lol_onclick_auth_or_block 의 // TODO)이라, 확장이
+     신 API로 처리한다. 차단 목록은 앱과 공유되므로 앱에도 그대로 반영된다. */
+  async function handleBlockUser() {
+    const d = W.g_lol_current_detail;
+    if (!d || d.post_seq == null || s(d.post_seq).length === 0) return;
+    if (!hasAuth()) { alert('차단하려면 자유게시판 로그인이 필요합니다.\n(글쓰기 등으로 한 번 로그인하면 자동으로 준비됩니다)'); return; }
+    const nick = s(d.nickname);
+    const authorId = s(d.author_id);
+    if (d.my_post === '1' || isMyContent(authorId)) { alert('자신은 차단할 수 없습니다.'); return; }
+    if (!W.confirm((nick || '이 사용자') + ' 님을 차단하시겠습니까?\n차단한 사용자의 글과 댓글은 보이지 않습니다.')) return;
+    // 차단에는 대상의 숫자 user id 가 필요 → 신 글 상세의 author.id 로 해석
+    const idr = await apiFetch('authorNumId', { post_seq: d.post_seq, author_id: authorId });
+    if (!idr || !idr.ok || idr.author_id == null) { alert('차단 대상 정보를 확인하지 못했습니다.'); return; }
+    const resp = await apiFetch('blockUser', { local_user_key: myKey(), blocked_user_id: idr.author_id, blocked: true });
+    if (resp && resp.ok) {
+      try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}   // offset 0 재조회 → 서버 차단목록 강제 갱신
+      const back = document.getElementById('cth-board-back-detail'); // 컴팩트 모드: 목록으로 복귀
+      if (back) back.click();
+      setTimeout(() => alert((nick || '사용자') + ' 님을 차단했습니다.\n(설정 메뉴 → 차단목록 에서 해제할 수 있습니다)'), 30);
+    } else {
+      const why = (resp && (resp.error || (resp.data && (resp.data.detail || resp.data.message)) || resp.status)) || '오류';
+      alert('차단 실패: ' + why);
+    }
+  }
+  // 사이트가 index.js 에서 lol_rpanel_header_button.onclick = lol_onclick_auth_or_block(원본참조)로
+  // 바인딩하므로, 그 버튼의 onclick 을 교체한다. 게스트(=로그인 요청)일 때는 원본을 그대로 호출.
+  function ensureBlockButtonBound() {
+    const btn = document.getElementById('lol_rpanel_header_button');
+    if (!btn || btn.__cthBlockBound) return;
+    btn.__cthBlockBound = true;
+    btn.onclick = function (e) {
+      if (!isGuest()) {
+        if (e && e.preventDefault) e.preventDefault();
+        handleBlockUser();
+        return;
+      }
+      if (typeof W.lol_onclick_auth_or_block === 'function') return W.lol_onclick_auth_or_block.call(this, e);
+    };
+  }
+
+  /* ---------------- 닉네임 변경 ----------------
+     사이트 경로는 (1) 변경 전 24시간 제한을 알리지 않고, (2) 서버가 일부 실패 코드만 처리해
+     제한에 걸려 거부돼도 아무 안내 없이 조용히 끝난다(확인만 되고 안 바뀐 것처럼 보임).
+     → 확장이 변경 전 경고를 띄우고, 신 API 응답의 실제 사유를 그대로 보여준다. */
+  function installNicknameChange() {
+    const btn = document.getElementById('lol_lpanel_userinfo_menu_button_nickname_change');
+    if (!btn || btn.__cthNickBound) return;
+    btn.__cthNickBound = true;
+    btn.onclick = function (e) {
+      if (e) { e.preventDefault(); e.stopPropagation(); }
+      const menu = document.getElementById('lol_lpanel_userinfo_menu'); if (menu) menu.style.display = 'none';
+      if (!hasAuth()) {   // 확장 인증이 없으면 사이트 기본 동작에 맡긴다
+        if (typeof W.lol_onclick_userinfo_nickname_change === 'function') {
+          try { return W.lol_onclick_userinfo_nickname_change.call(this, e); } catch (err) {}
+        }
+        alert('닉네임을 변경하려면 자유게시판 로그인이 필요합니다.');
+        return;
+      }
+      doChangeNickname();
+    };
+  }
+  async function doChangeNickname() {
+    const cur = s(W.g_lol_user_info && W.g_lol_user_info.nickname);
+    if (!W.confirm('닉네임을 변경하시겠습니까?\n\n※ 한 번 변경하면 24시간 동안 다시 변경할 수 없습니다.')) return;
+    const input = W.prompt('새 닉네임을 입력하세요.\n(변경 후 24시간 동안 재변경 불가)', cur);
+    if (input == null) return;                       // 취소
+    const nick = s(input).trim();
+    if (!nick) { alert('닉네임을 입력해 주세요.'); return; }
+    if (nick === cur) { alert('현재 닉네임과 같습니다.'); return; }
+    const resp = await apiFetch('changeNickname', { nickname: nick, local_user_key: myKey() });
+    if (resp && resp.ok) {
+      alert('닉네임이 "' + (resp.nickname || nick) + '" (으)로 변경되었습니다.\n24시간 동안은 다시 변경할 수 없습니다.');
+      try { refreshMyProfile(); } catch (e) {}
+      try { W.socket.emit('lol_user_info', W.g_lol_android_id); } catch (e) {}   // 사이트 표시 갱신
+      try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}
+    } else {
+      // 서버가 알려주는 실제 사유를 그대로 보여준다(24시간 제한 등)
+      const d = resp && resp.data;
+      let why = (d && (d.message || d.detail || d.error))
+        || (resp && (resp.error || (resp.status ? 'HTTP ' + resp.status : ''))) || '알 수 없는 오류';
+      if (typeof why !== 'string') { try { why = JSON.stringify(why); } catch (e) { why = String(why); } }
+      const limited = /24|하루|시간|limit|cooldown|too\s*many|429/i.test(why) || (resp && resp.status === 429);
+      alert('닉네임 변경에 실패했습니다.\n\n사유: ' + why +
+        (limited ? '\n\n닉네임은 변경 후 24시간이 지나야 다시 바꿀 수 있습니다.' : ''));
+    }
+  }
+
+  /* ---------------- 차단목록 (앱 '내 정보 → 차단 관리'와 동일) ----------------
+     사이트의 '차단목록 초기화' 버튼은 미구현('만들기 귀찮아서 유기')이라, 이름을 '차단목록'으로
+     바꾸고 확장이 신 API로 목록 조회·개별 해제·일괄 해제를 처리한다. */
+  function installBlockListMenu() {
+    const btn = document.getElementById('lol_lpanel_userinfo_menu_button_blocklist_reset');
+    if (!btn || btn.__cthBlockList) return;
+    btn.__cthBlockList = true;
+    btn.textContent = '차단목록';
+    btn.onclick = (e) => {
+      if (e) { e.preventDefault(); e.stopPropagation(); }
+      const m = document.getElementById('lol_lpanel_userinfo_menu'); if (m) m.style.display = 'none';
+      showBlockListModal();
+    };
+  }
+  function closeBlockListModal() {
+    const m = document.getElementById('cth-blocklist-modal'); if (m) m.remove();
+  }
+  async function showBlockListModal() {
+    if (document.getElementById('cth-blocklist-modal')) return;
+    if (!hasAuth()) { alert('차단목록을 보려면 자유게시판 로그인이 필요합니다.\n(글쓰기 등으로 한 번 로그인하면 자동으로 준비됩니다)'); return; }
+    const dark = document.documentElement.getAttribute('theme') === 'dark';
+    const ov = document.createElement('div');
+    ov.id = 'cth-blocklist-modal';
+    ov.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483100;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box';
+    ov.innerHTML =
+      '<div style="width:380px;max-width:100%;max-height:80vh;padding:20px;border-radius:10px;box-sizing:border-box;display:flex;flex-direction:column;font-size:14px;' +
+        (dark ? 'background:#252525;color:#eee' : 'background:#fff;color:#222;box-shadow:0 8px 30px rgba(0,0,0,.3)') + '">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">' +
+          '<div style="font-size:17px;font-weight:bold">차단목록</div>' +
+          '<div id="cth-blk-count" style="font-size:12px;color:#999"></div></div>' +
+        '<div style="font-size:12px;color:#999;margin-bottom:10px">차단한 사용자의 글과 댓글은 보이지 않습니다.</div>' +
+        '<div id="cth-blk-list" style="flex:1;overflow-y:auto;min-height:90px"></div>' +
+        '<div id="cth-blk-status" style="font-size:12px;min-height:16px;margin-top:8px;color:#888"></div>' +
+        '<div style="display:flex;gap:8px;justify-content:space-between;margin-top:10px">' +
+          '<button id="cth-blk-clearall" style="padding:7px 14px;border:0;border-radius:6px;cursor:pointer;background:#e03131;color:#fff;font-weight:bold">전체 해제</button>' +
+          '<button id="cth-blk-close" style="padding:7px 14px;border:0;border-radius:6px;cursor:pointer;background:#444;color:#ddd">닫기</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(ov);
+    ov.querySelector('#cth-blk-close').onclick = closeBlockListModal;
+    ov.addEventListener('click', (e) => { if (e.target === ov) closeBlockListModal(); });
+    ov.querySelector('#cth-blk-clearall').onclick = unblockAll;
+    await loadBlockList();
+  }
+  async function loadBlockList() {
+    const list = document.getElementById('cth-blk-list');
+    const cnt = document.getElementById('cth-blk-count');
+    const clearAll = document.getElementById('cth-blk-clearall');
+    if (!list) return;
+    list.innerHTML = '<div style="padding:22px;text-align:center;color:#999;font-size:13px">불러오는 중…</div>';
+    const resp = await apiFetch('blocks', { local_user_key: myKey() });
+    if (!document.getElementById('cth-blocklist-modal')) return;
+    if (!resp || !resp.ok) {
+      list.innerHTML = '<div style="padding:22px;text-align:center;color:#e03131;font-size:13px">차단목록을 불러오지 못했습니다.</div>';
+      return;
+    }
+    const rows = (resp.data && resp.data.results) || [];
+    if (cnt) cnt.textContent = rows.length + '명' + (resp.data && resp.data.block_limit ? ' / 최대 ' + resp.data.block_limit + '명' : '');
+    if (clearAll) clearAll.style.display = rows.length ? '' : 'none';
+    if (!rows.length) {
+      list.innerHTML = '<div style="padding:22px;text-align:center;color:#999;font-size:13px">차단한 사용자가 없습니다.</div>';
+      return;
+    }
+    const dark = document.documentElement.getAttribute('theme') === 'dark';
+    list.innerHTML = '';
+    for (const b of rows) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 4px;border-bottom:1px solid ' + (dark ? '#3a3a3a' : '#eee');
+      row.innerHTML =
+        '<img src="' + nEsc(mirrorUrl(b.avatar_url || '')) + '" style="width:34px;height:34px;border-radius:50%;object-fit:cover;flex-shrink:0;background:#888">' +
+        '<div style="flex:1;min-width:0">' +
+          '<div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + nEsc(b.nickname || '(알 수 없음)') + '</div>' +
+          // 앱과 동일하게 'N분전 차단'으로 보여주고, 정확한 시각은 마우스를 올리면 보이게 한다
+          '<div style="font-size:11px;color:#999" title="' + nEsc(s(b.created_at).replace('T', ' ')) + '">' +
+            nEsc(nRel(b.created_at) || '') + ' 차단</div>' +
+        '</div>' +
+        '<span class="cth-blk-un" style="cursor:pointer;color:#e03131;font-weight:bold;font-size:13px;flex-shrink:0">해제</span>';
+      row.querySelector('.cth-blk-un').onclick = () => unblockOne(b);
+      list.appendChild(row);
+    }
+  }
+  async function unblockOne(b) {
+    const status = document.getElementById('cth-blk-status');
+    if (!W.confirm((b.nickname || '이 사용자') + ' 님의 차단을 해제할까요?\n해당 사용자의 글과 댓글이 다시 표시됩니다.')) return;
+    if (status) { status.style.color = '#888'; status.textContent = '해제 중…'; }
+    const resp = await apiFetch('blockUser', { local_user_key: myKey(), blocked_user_id: b.id, blocked: false });
+    if (resp && resp.ok) {
+      if (status) status.textContent = (b.nickname || '') + ' 님을 해제했습니다.';
+      dropBlockedFromCache(b);
+      await loadBlockList();
+      try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}   // 목록 새로고침(다시 보이도록)
+    } else if (status) {
+      status.style.color = '#e03131';
+      status.textContent = '해제 실패: ' + ((resp && (resp.error || resp.status)) || '오류');
+    }
+  }
+  async function unblockAll() {
+    const status = document.getElementById('cth-blk-status');
+    const resp0 = await apiFetch('blocks', { local_user_key: myKey() });
+    const rows = (resp0 && resp0.ok && resp0.data && resp0.data.results) || [];
+    if (!rows.length) return;
+    if (!W.confirm('차단한 ' + rows.length + '명을 모두 해제할까요?')) return;
+    let done = 0, fail = 0;
+    for (const b of rows) {
+      if (status) { status.style.color = '#888'; status.textContent = '해제 중… (' + (done + fail + 1) + '/' + rows.length + ')'; }
+      const r = await apiFetch('blockUser', { local_user_key: myKey(), blocked_user_id: b.id, blocked: false });
+      if (r && r.ok) { done++; dropBlockedFromCache(b); } else fail++;
+    }
+    if (status) {
+      status.style.color = fail ? '#e03131' : '#888';
+      status.textContent = done + '명 해제 완료' + (fail ? (' · ' + fail + '명 실패') : '');
+    }
+    await loadBlockList();
+    try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}
+  }
+  // 사이트가 캐시한 차단 목록에서도 즉시 제거(새로고침 전에도 글이 보이도록)
+  function dropBlockedFromCache(b) {
+    try {
+      if (Array.isArray(W.g_lol_block_list)) {
+        W.g_lol_block_list = W.g_lol_block_list.filter((x) => String(x && (x.id || x)) !== String(b.id));
+      }
+    } catch (e) {}
+  }
+
+  // 붙여넣은 이미지 파일 → JPEG base64 (사이트 글쓰기와 동일하게 캔버스로 변환)
+  function pastedFileToJpeg(file, cb) {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const MAX = 1280;                                   // 과도한 용량 방지
+        let w = img.naturalWidth, h = img.naturalHeight;
+        if (!w || !h) { cb('', ''); return; }
+        if (w > MAX || h > MAX) { const k = Math.min(MAX / w, MAX / h); w = Math.round(w * k); h = Math.round(h * k); }
+        const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+        cv.getContext('2d').drawImage(img, 0, 0, w, h);
+        const url = cv.toDataURL('image/jpeg', 0.92);
+        cb(url.split(',')[1] || '', url);
+      };
+      img.onerror = () => cb('', '');
+      img.src = fr.result;
+    };
+    fr.onerror = () => cb('', '');
+    fr.readAsDataURL(file);
+  }
+
+  function closeFixedImageModal() {
+    const m = document.getElementById('cth-fixedimg-modal'); if (m) m.remove();
+  }
+  function showFixedImageModal() {
+    if (document.getElementById('cth-fixedimg-modal')) return;
+    if (!hasAuth()) { alert('고정짤을 등록하려면 자유게시판 로그인이 필요합니다.\n(글쓰기 등으로 한 번 로그인하면 자동으로 준비됩니다)'); return; }
+    const dark = document.documentElement.getAttribute('theme') === 'dark';
+    const ov = document.createElement('div');
+    ov.id = 'cth-fixedimg-modal';
+    ov.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483100;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box';
+    ov.innerHTML =
+      '<div style="width:360px;max-width:100%;padding:20px;border-radius:10px;box-sizing:border-box;font-size:14px;' +
+        (dark ? 'background:#252525;color:#eee' : 'background:#fff;color:#222;box-shadow:0 8px 30px rgba(0,0,0,.3)') + '">' +
+        '<div style="font-size:17px;font-weight:bold;margin-bottom:8px">고정짤 등록</div>' +
+        '<div style="font-size:12px;color:#999;margin-bottom:10px">이미지를 복사한 뒤 아래 영역을 클릭하고 <b>Ctrl+V</b> 로 붙여넣으세요.</div>' +
+        '<div id="cth-fixedimg-drop" tabindex="0" style="height:190px;border:2px dashed ' + (dark ? '#555' : '#ccc') +
+          ';border-radius:8px;display:flex;align-items:center;justify-content:center;overflow:hidden;cursor:pointer;outline:none;' +
+          'color:#999;font-size:13px;text-align:center">붙여넣기 대기 중…</div>' +
+        '<div id="cth-fixedimg-status" style="font-size:12px;min-height:16px;margin-top:8px;color:#888"></div>' +
+        '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">' +
+          '<button id="cth-fixedimg-cancel" style="padding:7px 14px;border:0;border-radius:6px;cursor:pointer;background:#444;color:#ddd">취소</button>' +
+          '<button id="cth-fixedimg-ok" style="padding:7px 14px;border:0;border-radius:6px;cursor:pointer;background:#339af0;color:#fff;font-weight:bold" disabled>등록</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(ov);
+
+    const drop = ov.querySelector('#cth-fixedimg-drop');
+    const status = ov.querySelector('#cth-fixedimg-status');
+    const okBtn = ov.querySelector('#cth-fixedimg-ok');
+    let b64 = '';
+    drop.focus();
+    ov.querySelector('#cth-fixedimg-cancel').onclick = closeFixedImageModal;
+    ov.addEventListener('click', (e) => { if (e.target === ov) closeFixedImageModal(); });
+    drop.addEventListener('click', () => drop.focus());
+
+    const onPaste = (e) => {
+      const items = (e.clipboardData && e.clipboardData.items) || [];
+      for (const it of items) {
+        if (it.type && it.type.indexOf('image') === 0) {
+          e.preventDefault();
+          status.style.color = '#888'; status.textContent = '이미지 읽는 중…';
+          pastedFileToJpeg(it.getAsFile(), (data, url) => {
+            if (!data) { status.style.color = '#e03131'; status.textContent = '이미지를 읽지 못했습니다.'; return; }
+            b64 = data; okBtn.disabled = false;
+            drop.innerHTML = '<img src="' + url + '" style="max-width:100%;max-height:100%;object-fit:contain">';
+            status.style.color = '#888';
+            status.textContent = '붙여넣기 완료 (' + Math.round(data.length * 3 / 4 / 1024) + 'KB) — [등록]을 누르세요.';
+          });
+          return;
+        }
+      }
+      status.style.color = '#e03131'; status.textContent = '클립보드에 이미지가 없습니다.';
+    };
+    document.addEventListener('paste', onPaste, true);
+    // 모달이 사라지면 paste 리스너도 정리
+    new MutationObserver((ms, obs) => {
+      if (!document.getElementById('cth-fixedimg-modal')) { document.removeEventListener('paste', onPaste, true); obs.disconnect(); }
+    }).observe(document.body, { childList: true });
+
+    okBtn.onclick = async () => {
+      if (!b64) return;
+      okBtn.disabled = true; status.style.color = '#888'; status.textContent = '등록 중…';
+      const resp = await apiFetch('fixedImage', { image: b64, local_user_key: myKey() });
+      if (resp && resp.ok) {
+        closeFixedImageModal();
+        setTimeout(() => alert('고정짤이 등록되었습니다.'), 30);
+      } else {
+        okBtn.disabled = false;
+        status.style.color = '#e03131';
+        status.textContent = '등록 실패: ' + ((resp && (resp.error || (resp.data && (resp.data.detail || resp.data.message)) || resp.status)) || '오류');
+      }
+    };
+  }
+  async function clearFixedImage() {
+    if (!hasAuth()) { alert('고정짤을 삭제하려면 자유게시판 로그인이 필요합니다.'); return; }
+    if (!W.confirm('등록된 고정짤을 삭제하시겠습니까?')) return;
+    const resp = await apiFetch('fixedImage', { clear: true, local_user_key: myKey() });
+    if (resp && resp.ok) alert('고정짤이 삭제되었습니다.');
+    else alert('고정짤 삭제 실패: ' + ((resp && (resp.error || (resp.data && (resp.data.detail || resp.data.message)) || resp.status)) || '오류'));
+  }
+
   // socket / 렌더 함수가 준비될 때까지 대기 후 설치
   let tries = 0;
   const timer = setInterval(() => {
     wrapRenderFns();
     try { installAuth(); } catch (e) {}
     try { installNotificationCenter(); } catch (e) {}
+    try { installFixedImageMenu(); } catch (e) {}
+    try { installBlockListMenu(); } catch (e) {}
+    try { installNicknameChange(); } catch (e) {}
+    try { installReplyGifCapture(); } catch (e) {}
+    try { installWriteWebpCapture(); } catch (e) {}
     const done = wrapSocket();
     if ((done && W.lol_lpanel_update && W.lol_lpanel_update.__cthWrapped) || ++tries > 100) {
       clearInterval(timer);
