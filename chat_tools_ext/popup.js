@@ -161,7 +161,10 @@ async function checkUpdate() {
     const status = res && (res.status || res[0]);
     const version = (res && (res.version || (res[1] && res[1].version))) || '';
     if (status === 'update_available') { offerApply(version); return; }
-    if (status === 'throttled') setNote('확인 요청이 잦아 잠시 막혔습니다. 조금 뒤에 다시 눌러 주세요.');
+    // 크롬은 수동 확인을 확장당 약 5시간에 한 번으로 제한한다(kDefaultUpdateFrequency = 5h).
+    // 그 사이에도 크롬 자체 자동 확인은 돌기 때문에, 새 버전이 나오면 알아서 받아 둔다.
+    if (status === 'throttled') setNote('크롬의 확인 주기 제한(약 5시간)에 걸렸습니다.\n'
+      + '새 버전이 나오면 크롬이 알아서 받아 두고, 그때 여기에 [지금 적용]이 표시됩니다.');
     else setNote('최신 버전입니다.', 'good');
   } catch (e) {
     setNote('업데이트를 확인할 수 없습니다.\n' + ((e && e.message) || e), 'warn');
