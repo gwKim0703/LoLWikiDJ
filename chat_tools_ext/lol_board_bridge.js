@@ -411,7 +411,12 @@
       .cth-wimg-add{border:1px dashed red;color:red;font-size:40px;font-weight:bold;cursor:pointer;
         user-select:none;line-height:1}
       .cth-wimg-add:hover{background:rgba(224,49,49,.08)}
-      #cth-wimg-guide{color:red;font-weight:bold;margin-top:8px}
+      /* 안내문 + [전체 비우기] 한 줄. 사진이 없으면 줄째로 감춘다. */
+      #cth-wimg-bar{display:none;align-items:center;gap:10px;margin-top:8px;width:100%}
+      #cth-wimg-guide{color:red;font-weight:bold}
+      #cth-wimg-clear{flex-shrink:0;margin-left:auto;font-family:inherit;font-size:11px;
+        border:1px solid #999;border-radius:5px;padding:3px 9px;background:transparent;color:#888;cursor:pointer}
+      #cth-wimg-clear:hover{border-color:#e03131;background:rgba(224,49,49,.10);color:#e03131}
     `;
     document.head.appendChild(st);
   }
@@ -501,6 +506,12 @@
     cthWriteDrag = -1;
     syncWriteImgsToSite();
     renderWriteImgs();
+  }
+
+  // [전체 비우기] — 한 장씩 ✕ 를 누르지 않아도 되게. 실수로 여러 장을 날리지 않도록 2장부터는 확인한다.
+  function onClickClearAllImages() {
+    if (cthWriteImgs.length > 1 && !W.confirm('첨부한 사진 ' + cthWriteImgs.length + '장을 모두 뺄까요?')) return;
+    clearWriteImages();
   }
 
   function makeWriteTile(image, index) {
@@ -617,8 +628,11 @@
       guide.textContent = cthWriteBusy ? '이미지 첨부 중... 기다려주셈'
         : cthWriteImgs.length ? '사진 ' + cthWriteImgs.length + '/' + CTH_WIMG_MAX + '장 첨부됨 · 사진을 끌어다 놓으면 순서가 바뀝니다.'
         : '';
-      guide.style.display = guide.textContent ? 'block' : 'none';
     }
+    const clear = document.getElementById('cth-wimg-clear');
+    if (clear) clear.style.display = cthWriteImgs.length ? 'block' : 'none';
+    const bar = document.getElementById('cth-wimg-bar');
+    if (bar) bar.style.display = (cthWriteBusy || cthWriteImgs.length) ? 'flex' : 'none';
   }
 
   // 사이트의 단일 첨부 UI 를 감추고 확장 첨부란을 그 자리에 설치
@@ -645,9 +659,23 @@
     box.id = 'cth-wimgs';
     holder.insertBefore(box, holder.firstChild);
 
+    const bar = document.createElement('div');
+    bar.id = 'cth-wimg-bar';
+
     const guide = document.createElement('div');
     guide.id = 'cth-wimg-guide';
-    holder.insertBefore(guide, box.nextSibling);
+    bar.appendChild(guide);
+
+    const clear = document.createElement('button');
+    clear.id = 'cth-wimg-clear';
+    clear.type = 'button';
+    clear.className = 'no-drag';
+    clear.textContent = '전체 비우기';
+    clear.title = '첨부한 사진을 모두 뺍니다';
+    clear.addEventListener('click', onClickClearAllImages);
+    bar.appendChild(clear);
+
+    holder.insertBefore(bar, box.nextSibling);
 
     renderWriteImgs();
     log('글쓰기 사진 첨부란 설치됨(최대 ' + CTH_WIMG_MAX + '장)');
