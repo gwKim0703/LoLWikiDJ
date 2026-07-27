@@ -26,6 +26,7 @@ ftp/
 *.apk
 *.xapk
 *.json
+!chat_tools_ext/manifest.json
 *.zip
 
 lolwiki/

@@ -107,6 +107,62 @@
     font-size: 12px;
     padding: 4px 0;
   }
+
+  /* 버전 섹션 */
+  .ver-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .ver-name {
+    flex: 1;
+    font-size: 13px;
+    color: #fff;
+  }
+  .ver-src {
+    color: #888;
+    font-weight: normal;
+    font-size: 11px;
+  }
+  #updateBtn {
+    border: 1px solid #3a3a3a;
+    background: #2a2a2a;
+    color: #ddd;
+    border-radius: 5px;
+    padding: 4px 9px;
+    font-size: 11px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #updateBtn:hover:not(:disabled) {
+    background: #339af0;
+    border-color: #339af0;
+    color: #fff;
+  }
+  #updateBtn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  #updateBtn.apply {
+    background: #2b8a3e;
+    border-color: #2b8a3e;
+    color: #fff;
+    font-weight: 600;
+  }
+  #updateBtn.apply:hover:not(:disabled) {
+    background: #37b24d;
+    border-color: #37b24d;
+  }
+  .ver-note {
+    display: none;
+    margin-top: 6px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: #999;
+    white-space: pre-line;
+  }
+  .ver-note.good { color: #51cf66; }
+  .ver-note.warn { color: #ffa94d; }
 </style>
 </head>
 <body>
@@ -130,6 +186,13 @@
     <input type="checkbox" id="unloadGuard">
     <span>새로고침·뒤로가기 시 이탈 확인창 표시</span>
   </label>
+
+  <div class="section-title">버전</div>
+  <div class="ver-row">
+    <span class="ver-name">롤디칩 <span id="verText">–</span> <span id="verSrc" class="ver-src"></span></span>
+    <button id="updateBtn">업데이트 확인</button>
+  </div>
+  <div id="verNote" class="ver-note"></div>
 
   <script src="popup.js"></script>
 </body>

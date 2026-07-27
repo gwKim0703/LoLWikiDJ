@@ -122,6 +122,8 @@ function b64ToBytes(b64) {
 // format: 'gif' | 'webp' | 'jpg'(기본). GIF·WebP 는 캔버스 변환 시 애니메이션이 사라지므로
 // 원본 바이트를 그대로 올리고 형식도 그대로 알린다.
 const IMAGE_MIME = { gif: 'image/gif', webp: 'image/webp', jpg: 'image/jpeg' };
+const MAX_POST_IMAGES = 10;                 // LegacyPostCreate.attachments 상한(앱과 동일)
+let _uploadSeq = 0;                         // 동시 업로드 파일명 충돌 방지용
 async function uploadImage(imageData, format) {
   if (!imageData) return { ok: false, error: 'no image' };
   const fmt = IMAGE_MIME[format] ? format : 'jpg';
@@ -136,8 +138,9 @@ async function uploadImage(imageData, format) {
   const auth = await getAuth();
   const fd = new FormData();
   fd.append('password', IMAGE_UPLOAD_PASSWORD);
+  // 여러 장을 동시에 올리므로 파일명이 겹치지 않게 한다(Date.now() 만 쓰면 같은 ms 에 전부 같은 이름)
   fd.append('image', new Blob([bytes], { type: IMAGE_MIME[fmt] }),
-    'lolwikidj-' + Date.now().toString(36) + '.' + fmt);
+    'lolwikidj-' + Date.now().toString(36) + '-' + (++_uploadSeq).toString(36) + '.' + fmt);
   const headers = Object.assign({}, LOLAPI_HEADERS);          // Authorization 없음(의도적)
   if (auth && auth.device_id) headers['X-Device-ID'] = auth.device_id;
   let r, netErr = '';
@@ -148,7 +151,8 @@ async function uploadImage(imageData, format) {
   const id = j && ((j.data && j.data.id) || j.image_id || j.id);
   console.log('[cth-bg] uploadImage bytes=' + bytes.length, 'originRule=' + originOk, r && r.status,
     id || netErr || (j && j.message));
-  if (r && r.ok && id) return { ok: true, image_id: String(id), image_format: fmt };
+  // byte_size 는 글 작성의 attachments 에 필수다(0 이거나 없으면 서버가 IMAGE_SIZE_REQUIRED 로 거부)
+  if (r && r.ok && id) return { ok: true, image_id: String(id), image_format: fmt, byte_size: bytes.length };
   let why = netErr || (j && (j.message || j.detail)) || ('HTTP ' + (r ? r.status : '?'));
   if (!originOk && /등록/.test(String(why))) why += ' (Origin 치환 규칙 미적용 — 확장을 새로고침해 주세요)';
   return { ok: false, error: why };
@@ -185,13 +189,28 @@ async function resolveNewId(post_seq, author_id) {
   return null;
 }
 
-async function registerPending(image_id, image_format) {
+async function registerPending(image_id, image_format, byte_size) {
+  const body = { image_id, image_format };
+  if (byte_size > 0) body.byte_size = byte_size;      // 글 작성의 attachments 와 같은 값으로 맞춰 둔다
   const r = await authedFetch(`${LOLAPI_BASE}/board/legacy-write/images/pending`, {
-    method: 'POST', body: JSON.stringify({ image_id, image_format })
+    method: 'POST', body: JSON.stringify(body)
   }, { 'Content-Type': 'application/json' }).catch(() => null);
   return !!(r && r.ok);
 }
 
+
+/* ---------------- 새 버전 대기 알림 ----------------
+   웹스토어에 새 버전이 올라오면 크롬이 내려받은 뒤 이 이벤트를 준다.
+   실행 중에 바로 갈아끼우면 열려 있는 탭의 content script 가 끊기므로 여기서는 표시만 해 두고,
+   실제 적용은 팝업의 '지금 적용'(chrome.runtime.reload)에 맡긴다.
+   ※ 개발자 모드(압축 해제) 설치본에서는 크롬이 갱신을 하지 않아 이 이벤트도 오지 않는다. */
+chrome.runtime.onUpdateAvailable.addListener((details) => {
+  const version = (details && details.version) || '';
+  console.log('[cth-bg] 새 버전 대기 중:', version);
+  chrome.storage.local.set({ cthPendingUpdate: { version, at: Date.now() } });
+});
+// 적용이 끝났으면(설치/업데이트 완료) 대기 표시를 지운다
+chrome.runtime.onInstalled.addListener(() => chrome.storage.local.remove('cthPendingUpdate'));
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type !== 'cth-lolapi') return; // 다른 리스너가 처리
@@ -259,31 +278,61 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 
 
-  // ── 글쓰기 (원본 유지가 필요한 이미지(WebP)가 첨부된 경우에만 확장이 처리) ──
+  // ── 글쓰기 (사진 첨부가 있으면 확장이 처리) ──
   //    사이트와 동일 순서: 이미지 업로드 → pending 등록 → 글 작성
+  //    사진 2장 이상은 앱과 같은 attachments 배열로 보낸다(LegacyPostCreate.attachments, 최대 10장).
+  //    1장이면 지금까지 검증된 단일 image_id 경로를 그대로 쓴다.
   if (msg.kind === 'writePost') {
     (async () => {
-      let image_id = '', image_format = '', image_error = '';
-      if (p.image) {
-        const up = await uploadImage(p.image, p.image_format);
-        if (up.ok) { image_id = up.image_id; image_format = up.image_format; await registerPending(image_id, image_format); }
-        else { image_error = up.error || 'unknown'; console.log('[cth-bg] writePost image upload failed:', image_error); }
-      }
-      const body = {
+      const list = (Array.isArray(p.images) && p.images.length
+        ? p.images
+        : (p.image ? [{ image: p.image, image_format: p.image_format }] : [])).slice(0, MAX_POST_IMAGES);
+
+      // 넣은 순서가 글에 보이는 순서이므로 배열 위치를 그대로 유지한다
+      const ups = await Promise.all(list.map((it) => uploadImage(it && it.image, it && it.image_format)));
+      const okUps = ups.filter((u) => u && u.ok);
+      await Promise.all(okUps.map((u) => registerPending(u.image_id, u.image_format, u.byte_size)));
+      const failed = ups.find((u) => !u || !u.ok);
+      let image_error = failed ? (failed.error || 'unknown') : '';
+      if (failed) console.log('[cth-bg] writePost image upload failed:', image_error);
+
+      const base = {
         title: p.title || '',
         body: p.body || '',
         youtube_url: p.youtube_url || '',
-        image_id: image_id,
-        image_format: image_format,
         notice: false,
         request_id: p.request_id
       };
-      const r = await authedFetch(`${LOLAPI_BASE}/board/legacy-write/posts`,
+      const singleBody = () => Object.assign({}, base, {
+        image_id: okUps.length ? okUps[0].image_id : '',
+        image_format: okUps.length ? okUps[0].image_format : ''
+      });
+      // byte_size 는 반드시 실제 크기(>0)로 채워야 한다 — 빠지거나 0 이면 서버가 IMAGE_SIZE_REQUIRED 로 거부한다
+      const multiBody = () => Object.assign({}, base, {
+        attachments: okUps.map((u) => ({ image_id: u.image_id, image_format: u.image_format, byte_size: u.byte_size }))
+      });
+      const post = (body) => authedFetch(`${LOLAPI_BASE}/board/legacy-write/posts`,
         { method: 'POST', body: JSON.stringify(body) }, { 'Content-Type': 'application/json' });
+
+      let attached = okUps.length;
+      let r = await post(okUps.length > 1 ? multiBody() : singleBody());
+      // 서버가 attachments 를 받지 못하면(422) 첫 장만이라도 붙여 글은 살린다.
+      // request_id 가 같으므로 앞 요청이 실제로 통과했더라도 중복 등록되지 않는다.
+      // 조용히 1장으로 줄어들면 원인을 알 수 없으므로 서버가 알려준 사유를 그대로 올려보낸다.
+      if (r.status === 422 && okUps.length > 1) {
+        const why = await r.clone().json().catch(() => null);
+        const detail = why && why.detail;
+        const msg = Array.isArray(detail) ? (detail[0] && detail[0].msg) || JSON.stringify(detail[0]) : (detail || 'HTTP 422');
+        console.log('[cth-bg] writePost attachments 거부됨 → 사진 1장으로 재시도:', msg);
+        if (!image_error) image_error = '여러 장 첨부가 거부됨: ' + msg;
+        r = await post(singleBody());
+        attached = 1;
+      }
       const data = await r.json().catch(() => null);
-      console.log('[cth-bg] writePost', r.status, data);
+      console.log('[cth-bg] writePost', r.status, '사진 ' + attached + '/' + list.length, data);
       sendResponse({ ok: r.status >= 200 && r.status < 300, status: r.status, data,
-        image_ok: !p.image || !!image_id, image_error: image_error });
+        image_ok: attached >= list.length, image_count: attached, image_total: list.length,
+        image_error: image_error });
     })().catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
     return true;
   }

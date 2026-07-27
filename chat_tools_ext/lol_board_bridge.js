@@ -366,60 +366,325 @@
     }
   }
 
-  /* 글쓰기 쪽도 같은 문제: 사이트는 GIF 만 원본을 보관하고 WebP 는 캔버스로 JPEG 변환한다.
-     붙여넣기·드래그 두 경로 모두에서 WebP 원본을 따로 보관해 두었다가 등록 시 그대로 올린다. */
-  const cthWriteOrig = { data: '', fmt: '' };
-  function keepWriteOriginal(file) {
-    cthWriteOrig.data = ''; cthWriteOrig.fmt = '';
-    const fmt = file && CTH_KEEP_FMT[file.type];
-    if (fmt !== 'webp') return;                    // GIF 는 사이트가 이미 원본을 보낸다
-    const fr = new FileReader();
-    fr.onload = () => { cthWriteOrig.data = String(fr.result).split(',')[1] || ''; cthWriteOrig.fmt = fmt; };
-    fr.readAsDataURL(file);
+  /* ---------------- 글쓰기 사진 첨부 (최대 10장 · 순서 변경) ----------------
+     사이트의 첨부란은 사진을 한 장만 받고, GIF 외에는 캔버스로 JPEG 변환해 보낸다
+     (움직이는 WebP 는 정지 이미지가 되고, 여러 장은 아예 넣을 수 없다).
+     앱은 10장까지 올릴 수 있으므로 첨부란을 확장이 대신 그려 같은 수를 지원한다.
+       · 점선 칸에 붙여넣기(Ctrl+V)/드롭 → 첨부, 이후 [+] 로 같은 칸을 다시 열어 추가
+       · 타일을 끌어다 놓으면 글에 보이는 순서가 바뀐다 (a,b,c,d → a,d,b,c)
+       · GIF/WebP 는 원본 바이트 그대로 올리고(애니메이션 유지), 그 외는 사이트처럼 JPEG 로 변환
+     등록은 확장이 신 API 로 처리한다. 확장 인증이 없을 때를 대비해 첫 장은 사이트 전역변수에도
+     넣어 두어, 사이트 기본 경로로 넘어가도 최소한 한 장은 첨부된 채로 등록된다. */
+  const CTH_WIMG_MAX = 10;
+  const CTH_WIMG_MAX_BYTES = 30 * 1024 * 1024;   // LegacyPostImage.byte_size 상한
+  const cthWriteImgs = [];         // [{ data(base64), fmt, preview(dataURL) }] — 배열 순서 = 글에 보일 순서
+  let cthWriteSlotOpen = false;    // 빈 첨부칸(점선)이 열려 있는가
+  let cthWriteBusy = 0;            // 읽기/변환 중인 파일 수
+  let cthWriteDrag = -1;           // 순서 변경 중인 타일 index
+
+  function ensureWriteImgStyle() {
+    if (document.getElementById('cth-wimg-style')) return;
+    const st = document.createElement('style'); st.id = 'cth-wimg-style';
+    st.textContent = `
+      /* 사이트 [image-holder] 는 flex 라 첨부란이 가로로 늘어난다. 확장 UI 는 세로로 쌓는다. */
+      #lol_write [image-holder]{flex-direction:column;align-items:flex-start}
+      #cth-wimgs{display:flex;flex-wrap:wrap;gap:10px;width:100%}
+      .cth-wimg{position:relative;width:150px;height:150px;flex:0 0 auto;border-radius:6px;
+        box-sizing:border-box;display:flex;align-items:center;justify-content:center}
+      .cth-wimg img{max-width:100%;max-height:100%;object-fit:contain;cursor:grab;border:2px solid red;
+        border-radius:4px;background:rgba(128,128,128,.12)}
+      .cth-wimg[dragging]{opacity:.4}
+      .cth-wimg[drag_over]::after{content:'';position:absolute;inset:-4px;border:2px dashed #339af0;
+        border-radius:8px;pointer-events:none}
+      /* 순서 배지 — 끌어 놓은 순서가 글에 그대로 보인다는 걸 숫자로 알려준다 */
+      .cth-wimg-order{position:absolute;left:4px;top:4px;min-width:18px;height:18px;padding:0 5px;
+        border-radius:9px;background:rgba(0,0,0,.66);color:#fff;font-size:11px;font-weight:bold;
+        line-height:18px;text-align:center;pointer-events:none}
+      .cth-wimg-del{position:absolute;right:3px;top:3px;width:20px;height:20px;border-radius:50%;
+        background:rgba(0,0,0,.66);color:#fff;font-size:12px;font-weight:bold;line-height:20px;
+        text-align:center;cursor:pointer;user-select:none}
+      .cth-wimg-del:hover{background:#e03131}
+      /* 붙여넣기/드롭 칸 — 사이트의 점선 사각형과 같은 모양을 유지한다 */
+      .cth-wimg-drop{width:100%;max-width:400px;height:200px;padding:0;text-align:center;
+        border:1px dashed red;background:transparent;caret-color:transparent;font-size:large;cursor:pointer}
+      .cth-wimg-drop::placeholder{color:red;font-weight:bold}
+      .cth-wimg-add{border:1px dashed red;color:red;font-size:40px;font-weight:bold;cursor:pointer;
+        user-select:none;line-height:1}
+      .cth-wimg-add:hover{background:rgba(224,49,49,.08)}
+      #cth-wimg-guide{color:red;font-weight:bold;margin-top:8px}
+    `;
+    document.head.appendChild(st);
   }
-  function installWriteWebpCapture() {
-    const ph = document.getElementById('lol_write_image_placeholder');
-    if (ph && !ph.__cthWebpHooked) {
-      ph.__cthWebpHooked = true;
-      ph.addEventListener('paste', (e) => {
-        try {
-          const cd = e.clipboardData || W.clipboardData;
-          keepWriteOriginal(cd && cd.files && cd.files[0]);
-        } catch (err) {}
-      }, true);
-    }
-    // 드래그&드롭/파일선택 경로
-    if (typeof W.lol_write_image_ondrop === 'function' && !W.lol_write_image_ondrop.__cthWrapped) {
-      const orig = W.lol_write_image_ondrop;
-      W.lol_write_image_ondrop = function (e) {
-        try {
-          const files = (e && ((e.target && e.target.files) || (e.dataTransfer && e.dataTransfer.files))) || null;
-          keepWriteOriginal(files && files[0]);
-        } catch (err) {}
-        return orig.apply(this, arguments);
+
+  function b64ByteLength(b64) {
+    const n = b64 ? b64.length : 0;
+    if (!n) return 0;
+    return Math.floor(n * 3 / 4) - (b64[n - 1] === '=' ? 1 : 0) - (b64[n - 2] === '=' ? 1 : 0);
+  }
+
+  // 파일 → {data, fmt, preview}. GIF/WebP 는 원본 유지, 그 외는 사이트와 같이 JPEG 로 변환한다.
+  function cthReadWriteImage(file) {
+    return new Promise((resolve) => {
+      const fr = new FileReader();
+      fr.onerror = () => resolve(null);
+      fr.onload = () => {
+        const url = String(fr.result || '');
+        const keep = CTH_KEEP_FMT[file.type];
+        if (keep) { resolve({ data: url.split(',')[1] || '', fmt: keep, preview: url }); return; }
+        const img = new Image();
+        img.onerror = () => resolve(null);
+        img.onload = () => {
+          const cv = document.createElement('canvas');
+          cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+          cv.getContext('2d').drawImage(img, 0, 0);
+          const jpeg = cv.toDataURL('image/jpeg');
+          resolve({ data: jpeg.split(',')[1] || '', fmt: 'jpg', preview: jpeg });
+        };
+        img.src = url;
       };
-      W.lol_write_image_ondrop.__cthWrapped = true;
+      fr.readAsDataURL(file);
+    });
+  }
+
+  // 사이트 기본 경로(확장 인증 없음)로 넘어가도 한 장은 남도록 첫 장을 사이트 전역변수에 반영.
+  // 사이트가 보낼 수 있는 형식은 JPEG 와 GIF 뿐이라, WebP 는 넘기기 직전에 JPEG 로 바꿔 채운다.
+  function syncWriteImgsToSite() {
+    const first = cthWriteImgs[0];
+    try {
+      W.g_lol_write_image_data = first && first.fmt === 'jpg' ? first.data : '';
+      W.g_lol_write_image_data_gif = first && first.fmt === 'gif' ? first.data : '';
+    } catch (e) {}
+  }
+  function toJpegBase64(dataUrl) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onerror = () => resolve('');
+      img.onload = () => {
+        const cv = document.createElement('canvas');
+        cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+        cv.getContext('2d').drawImage(img, 0, 0);
+        resolve(cv.toDataURL('image/jpeg').split(',')[1] || '');
+      };
+      img.src = dataUrl;
+    });
+  }
+
+  async function addWriteImages(files) {
+    const list = Array.from(files || []).filter((f) => f && /^image\//.test(f.type));
+    if (!list.length) { alert('이미지가 아닙니다.'); return; }
+    const room = CTH_WIMG_MAX - cthWriteImgs.length;
+    if (room <= 0) { alert('사진은 최대 ' + CTH_WIMG_MAX + '장까지 첨부할 수 있습니다.'); return; }
+    const take = list.slice(0, room);
+    if (list.length > room) alert('사진은 최대 ' + CTH_WIMG_MAX + '장까지 첨부할 수 있습니다.');
+
+    cthWriteBusy += take.length;
+    cthWriteSlotOpen = false;
+    renderWriteImgs();
+    for (const f of take) {
+      const got = await cthReadWriteImage(f);
+      cthWriteBusy--;
+      // 읽는 동안 다른 붙여넣기가 겹쳐 들어올 수 있으므로 담기 직전에 한 번 더 확인한다
+      if (got && got.data && cthWriteImgs.length < CTH_WIMG_MAX) {
+        if (b64ByteLength(got.data) > CTH_WIMG_MAX_BYTES)
+          alert('사진 한 장이 30MB 를 넘어 첨부할 수 없습니다.' + (f.name ? '\n(' + f.name + ')' : ''));
+        else
+          cthWriteImgs.push(got);
+      }
+      renderWriteImgs();
+    }
+    syncWriteImgsToSite();
+  }
+
+  function clearWriteImages() {
+    cthWriteImgs.length = 0;
+    cthWriteSlotOpen = false;
+    cthWriteDrag = -1;
+    syncWriteImgsToSite();
+    renderWriteImgs();
+  }
+
+  function makeWriteTile(image, index) {
+    const tile = document.createElement('div');
+    tile.className = 'cth-wimg';
+    tile.setAttribute('index', String(index));
+    tile.draggable = true;
+    tile.addEventListener('dragstart', (e) => {
+      cthWriteDrag = index;
+      tile.toggleAttribute('dragging', true);
+      try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(index)); } catch (err) {}
+    });
+    tile.addEventListener('dragend', () => { cthWriteDrag = -1; renderWriteImgs(); });
+    tile.addEventListener('dragover', (e) => {
+      if (cthWriteDrag < 0) return;                 // 파일 드롭은 점선 칸에서만 받는다
+      e.preventDefault(); e.stopPropagation();
+      try { e.dataTransfer.dropEffect = 'move'; } catch (err) {}
+      tile.toggleAttribute('drag_over', true);
+    });
+    tile.addEventListener('dragleave', () => tile.toggleAttribute('drag_over', false));
+    tile.addEventListener('drop', (e) => {
+      if (cthWriteDrag < 0) return;
+      e.preventDefault(); e.stopPropagation();
+      const from = cthWriteDrag, to = index;
+      cthWriteDrag = -1;
+      if (from === to) { renderWriteImgs(); return; }
+      cthWriteImgs.splice(to, 0, cthWriteImgs.splice(from, 1)[0]);
+      syncWriteImgsToSite();                         // 순서가 바뀌면 첫 장도 바뀔 수 있다
+      renderWriteImgs();
+    });
+
+    const img = document.createElement('img');
+    img.src = image.preview;
+    img.title = '끌어다 놓으면 사진 순서가 바뀝니다.';
+    tile.appendChild(img);
+
+    const order = document.createElement('div');
+    order.className = 'cth-wimg-order';
+    order.textContent = String(index + 1);
+    tile.appendChild(order);
+
+    const del = document.createElement('div');
+    del.className = 'cth-wimg-del';
+    del.textContent = '✕';
+    del.title = '이 사진 빼기';
+    del.addEventListener('click', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      cthWriteImgs.splice(index, 1);
+      syncWriteImgsToSite();
+      renderWriteImgs();
+    });
+    tile.appendChild(del);
+    return tile;
+  }
+
+  function makeWriteDropSlot() {
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.className = 'cth-wimg-drop';
+    inp.placeholder = '여기에 붙여넣기(Ctrl+V) 또는 파일 드롭';
+    inp.maxLength = 0;
+    inp.addEventListener('input', () => { inp.value = ''; });      // 글자는 남기지 않는다
+    inp.addEventListener('paste', (e) => {
+      const cd = e.clipboardData || W.clipboardData;
+      const files = cd && cd.files;
+      if (files && files.length) { e.preventDefault(); addWriteImages(files); }
+    });
+    const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+    inp.addEventListener('dragenter', (e) => { stop(e); inp.style.borderWidth = '10px'; });
+    inp.addEventListener('dragover', (e) => { stop(e); inp.style.borderWidth = '10px'; });
+    inp.addEventListener('dragleave', (e) => { stop(e); inp.style.borderWidth = '1px'; });
+    inp.addEventListener('drop', (e) => {
+      stop(e); inp.style.borderWidth = '1px';
+      addWriteImages(e.dataTransfer && e.dataTransfer.files);
+    });
+    return inp;
+  }
+
+  function makeWriteAddButton() {
+    const add = document.createElement('div');
+    add.className = 'cth-wimg cth-wimg-add';
+    add.textContent = '+';
+    add.title = '사진 더 첨부하기';
+    add.addEventListener('click', () => { cthWriteSlotOpen = true; renderWriteImgs(true); });
+    return add;
+  }
+
+  // 사이트의 단일 첨부 UI 감추기. 사이트의 '취소' 처리가 첨부란을 다시 표시하므로 렌더마다 확인한다.
+  function hideSiteWriteImageUI() {
+    ['lol_write_image_placeholder', 'lol_write_image', 'lol_write_image_guide'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el && el.style.display !== 'none') el.style.display = 'none';
+    });
+  }
+
+  // 첨부란 전체를 상태에서 다시 그린다(타일 → 점선 칸 또는 [+] → 안내문)
+  function renderWriteImgs(focusSlot) {
+    const box = document.getElementById('cth-wimgs');
+    if (!box) return;
+    hideSiteWriteImageUI();
+    while (box.firstChild) box.removeChild(box.firstChild);
+
+    cthWriteImgs.forEach((image, i) => box.appendChild(makeWriteTile(image, i)));
+
+    let slot = null;
+    if (cthWriteImgs.length < CTH_WIMG_MAX) {
+      if (cthWriteSlotOpen || !cthWriteImgs.length) box.appendChild(slot = makeWriteDropSlot());
+      else box.appendChild(makeWriteAddButton());
+    }
+    if (focusSlot && slot) slot.focus();
+
+    const guide = document.getElementById('cth-wimg-guide');
+    if (guide) {
+      guide.textContent = cthWriteBusy ? '이미지 첨부 중... 기다려주셈'
+        : cthWriteImgs.length ? '사진 ' + cthWriteImgs.length + '/' + CTH_WIMG_MAX + '장 첨부됨 · 사진을 끌어다 놓으면 순서가 바뀝니다.'
+        : '';
+      guide.style.display = guide.textContent ? 'block' : 'none';
     }
   }
-  // 글쓰기 등록(WebP 원본이 있을 때만 가로챔) — 나머지는 사이트가 그대로 처리
+
+  // 사이트의 단일 첨부 UI 를 감추고 확장 첨부란을 그 자리에 설치
+  function installWriteImages() {
+    // 글쓰기 취소로 폼이 비워지면 첨부도 함께 비운다
+    if (typeof W.lol_onclick_write_cancel === 'function' && !W.lol_onclick_write_cancel.__cthWrapped) {
+      const orig = W.lol_onclick_write_cancel;
+      W.lol_onclick_write_cancel = function () {
+        const subject = document.getElementById('lol_write_subject');
+        const r = orig.apply(this, arguments);
+        // 사이트는 확인 창에서 취소하면 값을 남겨두므로, 제목이 실제로 비워졌을 때만 첨부도 비운다
+        if (subject && !subject.value) clearWriteImages();
+        return r;
+      };
+      W.lol_onclick_write_cancel.__cthWrapped = true;
+    }
+
+    const holder = document.querySelector('#lol_write [image-holder]');
+    if (!holder || holder.__cthWimgHooked) return;
+    holder.__cthWimgHooked = true;
+    ensureWriteImgStyle();
+
+    const box = document.createElement('div');
+    box.id = 'cth-wimgs';
+    holder.insertBefore(box, holder.firstChild);
+
+    const guide = document.createElement('div');
+    guide.id = 'cth-wimg-guide';
+    holder.insertBefore(guide, box.nextSibling);
+
+    renderWriteImgs();
+    log('글쓰기 사진 첨부란 설치됨(최대 ' + CTH_WIMG_MAX + '장)');
+  }
+
+  // 글쓰기 등록(사진이 첨부된 경우 확장이 처리) — 사진이 없으면 사이트가 그대로 처리
   let _writingPost = false;
   async function handleWritePost(data) {
     data = data || {};
-    const image = cthWriteOrig.data;
-    if (!image || _writingPost) return;
-    if (!hasAuth()) {                                  // 인증이 없으면 사이트 기본 동작으로
-      try { _origEmit('lol_write', data); } catch (e) {}
-      cthWriteOrig.data = ''; cthWriteOrig.fmt = '';
+    if (!cthWriteImgs.length || _writingPost) return;
+    if (cthWriteBusy) { alert('사진을 읽는 중입니다. 잠시 후 다시 등록해 주세요.'); return; }
+    // 사이트 로그인 편승은 비동기라 페이지를 연 직후엔 아직 준비 중일 수 있다(댓글 작성과 동일하게 대기)
+    if (!hasAuth()) {
+      for (let i = 0; i < 25 && !hasAuth(); i++) await new Promise((r) => setTimeout(r, 200));
+    }
+    if (!hasAuth()) {                                  // 그래도 없으면 사이트 기본 동작으로(첫 장만 첨부)
+      const first = cthWriteImgs[0];
+      if (first && first.fmt === 'webp') {             // 사이트는 WebP 를 그대로 보내지 못한다
+        const jpeg = await toJpegBase64(first.preview);
+        try { W.g_lol_write_image_data = jpeg; W.g_lol_write_image_data_gif = ''; } catch (e) {}
+        data = Object.assign({}, data, { image: jpeg, is_gif: false });
+      }
+      if (cthWriteImgs.length > 1)
+        alert('확장 인증이 준비되지 않아 사진 1장만 첨부해 등록합니다.\n(글쓰기 등으로 한 번 로그인하면 다음부터 여러 장이 올라갑니다)');
+      try { _origEmit('lol_write', data); } catch (e) {}   // 첨부 비우기는 사이트 등록 완료(lol_write) 때
       return;
     }
     _writingPost = true;
+    const total = cthWriteImgs.length;
     const resp = await apiFetch('writePost', {
       request_id: genReqId(), title: s(data.subject), body: s(data.body),
-      youtube_url: s(data.youtube_url), image: image, image_format: cthWriteOrig.fmt
+      youtube_url: s(data.youtube_url),
+      images: cthWriteImgs.map((it) => ({ image: it.data, image_format: it.fmt }))
     });
     _writingPost = false;
-    cthWriteOrig.data = ''; cthWriteOrig.fmt = '';
     if (resp && resp.ok) {
+      clearWriteImages();
       // 사이트의 lol_write 응답 처리와 동일하게 정리
       try { W.lol_confirm_api_session(); } catch (e) {}
       ['lol_write_subject', 'lol_write_body', 'lol_write_youtube'].forEach((id) => {
@@ -428,7 +693,9 @@
       try { W.lol_write_panel_toggle(false); } catch (e) {}
       try { W.lol_onclick_aritcle_list_refresh(); } catch (e) {}
       if (resp.image_ok === false) {
-        setTimeout(() => alert('글은 등록됐지만 이미지는 첨부되지 않았습니다.\n사유: ' + (resp.image_error || '알 수 없음')), 50);
+        const got = resp.image_count || 0;
+        setTimeout(() => alert('글은 등록됐지만 사진 ' + total + '장 중 ' + got + '장만 첨부되었습니다.'
+          + (resp.image_error ? '\n사유: ' + resp.image_error : '')), 50);
       }
     } else {
       const why = (resp && resp.data && (resp.data.detail || resp.data.message)) || (resp && (resp.status || resp.error)) || '오류';
@@ -509,6 +776,53 @@
       const why = (resp && resp.data && (resp.data.detail || resp.data.message)) || (resp && (resp.status || resp.error)) || '오류';
       alert(what + ' 등록 실패: ' + why);
     }
+  }
+
+  /* ---------------- 5번째 이후 첨부 사진 ----------------
+     사이트 상세는 사진 칸을 img1~img4 네 개만 두고 있어, 앱에서 10장까지 올릴 수 있게 된 지금은
+     5번째부터가 아예 보이지 않는다(데이터는 image_urls 로 전부 내려온다).
+     → 렌더가 끝난 뒤 img4 아래에 나머지를 같은 마크업으로 이어 붙인다.
+     사이트와 동일한 class 를 쓰므로 확대/축소·'채팅창에 공유' 아이콘이 그대로 동작한다.
+     (pic_multi/pic_new/doodlr 같은 구 데이터 경로는 4장을 넘지 않으므로 image_urls 만 본다) */
+  const CTH_SITE_IMG_SLOTS = 4;
+  let _extraImgSeq = '';
+  function renderExtraImages() {
+    const host = document.getElementById('lol_rpanel_body_img4');
+    if (!host) return;
+    const d = W.g_lol_current_detail || {};
+    const urls = Array.isArray(d.image_urls) ? d.image_urls.filter(Boolean) : [];
+    const extra = urls.slice(CTH_SITE_IMG_SLOTS);
+
+    // 같은 글을 다시 그리는 경우엔 사진별 확대/축소 상태를 유지한다(사이트 img1~4 와 같은 동작)
+    const old = Array.prototype.slice.call(document.querySelectorAll('.cth-extra-img'));
+    const keep = s(d.post_seq) === _extraImgSeq ? old.map((e) => e.hasAttribute('small')) : [];
+    _extraImgSeq = s(d.post_seq);
+    old.forEach((e) => e.remove());
+    if (!extra.length) return;
+
+    const toMirror = typeof W.lol_convert_uri_to_mirror === 'function' ? W.lol_convert_uri_to_mirror : mirrorUrl;
+    let after = host;
+    extra.forEach((url, i) => {
+      const div = document.createElement('div');
+      div.className = 'lol_rpanel_img_body cth-extra-img';
+      div.toggleAttribute('small', i < keep.length ? keep[i] : true);
+
+      const img = document.createElement('img');
+      img.className = 'lol_rpanel_img_img';
+      img.style.width = '100%';
+      img.src = toMirror(url);
+      div.appendChild(img);
+
+      const add = document.createElement('div');
+      add.className = 'lol_rpanel_img_add';
+      add.setAttribute('src', url);
+      div.appendChild(add);
+
+      div.onclick = W.lol_onclick_img;                 // 클릭 시 확대/축소 (사이트 함수 그대로)
+      add.onclick = W.lol_onclick_img_add;             // 채팅창에 이미지 공유
+      after.parentNode.insertBefore(div, after.nextSibling);
+      after = div;
+    });
   }
 
   /* ---------------- 게시글 추천/비추천 ---------------- */
@@ -774,6 +1088,7 @@
         try { restoreWriteToBottom(); } catch (e) {}
         const r = orig.apply(this, arguments);
         try { showDetailLoading(false); } catch (e) {}   // 글 내용이 떴으니 로딩 표시 해제
+        try { renderExtraImages(); } catch (e) {}        // 사이트 칸(4개)을 넘는 첨부 사진
         try { decorateAllReplies(); } catch (e) {}       // 답글 들여쓰기 + '답글' 버튼
         try { renderVoteUI(); } catch (e) {}             // 추천/비추천 버튼·상태
         try { loadVoteState(); } catch (e) {}            // 내 추천 상태 조회(글이 바뀐 경우만)
@@ -804,8 +1119,8 @@
       if (event === 'lol_like' && hasAuth()) { handleVote(args[0] && args[0].post_seq, 'up'); return sock; }
       // 닉네임 우클릭(작성자 글 목록) — 서버 경로가 동결된 구 PHP라 확장이 대신 처리
       if (event === 'lol_get_article_list_others') { handleOthers(args[0]); return sock; }
-      // 글쓰기: WebP 원본이 보관돼 있을 때만 가로챈다(사이트는 WebP 를 JPEG 로 변환해 버림)
-      if (event === 'lol_write' && cthWriteOrig.data) { handleWritePost(args[0]); return sock; }
+      // 글쓰기: 확장 첨부란에 사진이 있을 때만 가로챈다(사이트는 한 장만, 그마저도 JPEG 로 변환)
+      if (event === 'lol_write' && cthWriteImgs.length) { handleWritePost(args[0]); return sock; }
       // 답글이거나 GIF 가 첨부된 경우에만 가로챈다(그 외 일반 댓글은 사이트가 그대로 처리).
       //  · 답글: 사이트는 parent_id 를 0 으로 고정해 보냄
       //  · GIF: 사이트는 캔버스로 JPEG 변환해 보내 애니메이션이 사라짐
@@ -821,6 +1136,9 @@
     // 확인을 눌러도 삭제된 글이 그대로 남아 보인다. 리스너를 하나 더 붙여(사이트 것 다음에 실행)
     // 상세를 비우고 목록을 새로고침한다.
     if (typeof sock.on === 'function') {
+      // 사이트 기본 경로로 등록된 경우(확장 인증 없음) 첨부란도 함께 비운다.
+      // 사이트 핸들러는 제목·내용·영상만 비우고 사진은 남겨 둔다.
+      sock.on('lol_write', function () { try { clearWriteImages(); } catch (e) {} });
       sock.on('lol_delete', function () {
         try { W.g_lol_current_detail = {}; } catch (e) {}
         try { W.lol_rpanel_update(); } catch (e) {}                  // 상세 → '글이 존재하지 않습니다.'
@@ -1518,7 +1836,7 @@
     try { installBlockListMenu(); } catch (e) {}
     try { installNicknameChange(); } catch (e) {}
     try { installReplyGifCapture(); } catch (e) {}
-    try { installWriteWebpCapture(); } catch (e) {}
+    try { installWriteImages(); } catch (e) {}
     const done = wrapSocket();
     if ((done && W.lol_lpanel_update && W.lol_lpanel_update.__cthWrapped) || ++tries > 100) {
       clearInterval(timer);

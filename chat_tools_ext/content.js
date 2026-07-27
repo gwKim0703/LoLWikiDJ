@@ -1383,6 +1383,12 @@
         }));
         sendResponse({ ok: true });
       }
+      // 확장 업데이트 적용 직전 호출 — 확장이 다시 켜지면 이 content script 는 끊기므로 미리 새로고침
+      if (msg.type === 'cth-reload-page') {
+        sendResponse({ ok: true });
+        location.reload();
+        return;
+      }
       if (msg.type === 'cth-delete-profile') {
         chrome.storage.local.get('cthProfiles', (data) => {
           const profiles = data.cthProfiles || {};
