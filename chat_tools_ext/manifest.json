@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "롤디칩",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "롤디 전용 확장 프로그램입니다",
   "icons": {
     "16": "icon16.png",

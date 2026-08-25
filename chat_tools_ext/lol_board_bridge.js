@@ -139,6 +139,30 @@
     return false;
   }
 
+  /* ---------------- 사이트 버튼 가로채기 ----------------
+     사이트는 window.onload 에서 여러 버튼의 onclick 을 자기 핸들러로 대입한다(static/index.js).
+     확장이 주입되는 document_idle 은 페이지가 무거우면 크롬이 onload 보다 앞으로 당기기 때문에,
+     확장이 btn.onclick 으로 붙으면 뒤이은 사이트 대입에 덮여 동작이 통째로 사라진다
+     (반대 순서면 확장이 이긴다 = 로딩 속도에 따라 되기도 안 되기도 하는 경합이었다).
+     그래서 대입 경쟁에서 빠져나와 document 의 캡처 단계에서 클릭을 가로챈다.
+       - 캡처는 대상 요소의 onclick 보다 항상 먼저 실행된다
+       - addEventListener 는 btn.onclick 대입에 덮이지 않는다
+     → 붙는 순서와 무관해진다. stopImmediatePropagation 으로 사이트 핸들러까지 막으므로,
+       사이트 기본 동작이 필요하면 핸들러 안에서 직접 호출한다. */
+  const _capturedIds = new Set();
+  function bindOverSite(id, handler) {
+    if (_capturedIds.has(id)) return;
+    _capturedIds.add(id);
+    document.addEventListener('click', function (e) {
+      const el = e.target;
+      if (!el || typeof el.closest !== 'function') return;
+      const hit = el.closest('#' + id);
+      if (!hit) return;
+      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+      handler.call(hit, e);
+    }, true);
+  }
+
   // 본문의 '@닉네임' 멘션을 파란 하이라이트 스팬으로 감싸 플레인 텍스트와 시각적으로 구분한다.
   // 나머지 본문은 그대로 두고(<,> 는 건너뛰어 기존 HTML을 깨지 않음) 멘션 토큰만 감싼다.
   // (댓글은 index_lol.js에서 text.innerHTML = reply_title 로 렌더되므로 스팬이 그대로 적용됨)
@@ -147,6 +171,17 @@
     return String(body).replace(/(^|[\s(])@([^\s@<>]{1,30})/g,
       function (m, pre, nick) { return pre + '<span class="cth-mention">@' + nick + '</span>'; });
   }
+
+  /* 본문·댓글 줄바꿈 복구.
+     신 API(legacy-read-compat)는 개행을 LF('\n')만으로 내려주는데, 사이트 렌더(index_lol.js)는
+     본문에서 CRLF('\r\n')만 <br>로 바꾸고 댓글은 아예 바꾸지 않는다. 그래서 여러 줄 글이
+     한 줄로 붙어 보인다. 사이트 코드는 건드리지 않고 확장이 렌더 직전 데이터에서 처리한다.
+       - 본문: 개행을 CRLF로 통일만 해두면 사이트의 기존 치환이 <br>로 바꿔준다.
+       - 댓글: 사이트에 치환이 없으므로 확장이 직접 <br>로 바꾼다.
+     둘 다 결과가 멱등이라 렌더마다 호출해도 안전하다. <br>·<font> 등이 박혀 있는 구 게시물에는
+     단독 LF 가 없어 영향이 없다. */
+  function nlToCrlf(x) { return String(x).replace(/\r\n|\r|\n/g, '\r\n'); }
+  function nlToBr(x)   { return String(x).replace(/\r\n|\r|\n/g, '<br>'); }
 
   /* ---------------- 시각 표기 후처리 + 답글 스레드 표시 ----------------
      DJ 사이트가 신 API로 목록/글을 직접 가져오므로, 확장은 '렌더 직전'에 사이트 데이터의
@@ -235,6 +270,8 @@
     }
     // 내 글 판정 보정 → 사이트의 '삭제' 버튼이 다시 표시된다(사이트는 '1' 문자열로 비교)
     if (d.my_post !== '1' && isMyContent(s(d.author_id))) d.my_post = '1';
+    // 본문 줄바꿈: CRLF 로 통일해두면 사이트 렌더가 그대로 <br> 로 바꾼다(nlToCrlf 주석 참고)
+    if (d.post_text) d.post_text = nlToCrlf(d.post_text);
     if (!Array.isArray(d.replys)) return;
     for (const r of d.replys) {
       if (!r) continue;
@@ -244,7 +281,9 @@
       if (r.__cthRaw == null) { const raw = s(r.reply_date).trim(); if (RAW_TS.test(raw)) r.__cthRaw = raw; }
       if (r.__cthRaw) r.reply_date = fmtRelTime(r.__cthRaw, true);
       // 멘션 강조는 시간과 무관하므로 한 번만
-      if (!r.__cthMent) { if (r.reply_title) r.reply_title = decorateMentions(s(r.reply_title)); r.__cthMent = 1; }
+      // 줄바꿈은 멘션 처리 뒤에 <br> 로 바꾼다. 먼저 <br> 를 넣으면
+      // 줄 첫머리 '@닉네임' 이 멘션으로 인식되지 않게 되기 때문이다.
+      if (!r.__cthMent) { if (r.reply_title) r.reply_title = nlToBr(decorateMentions(s(r.reply_title))); r.__cthMent = 1; }
     }
     d.replys = threadReplies(d.replys);
   }
@@ -1567,17 +1606,12 @@
   // 사이트가 index.js 에서 lol_rpanel_header_button.onclick = lol_onclick_auth_or_block(원본참조)로
   // 바인딩하므로, 그 버튼의 onclick 을 교체한다. 게스트(=로그인 요청)일 때는 원본을 그대로 호출.
   function ensureBlockButtonBound() {
-    const btn = document.getElementById('lol_rpanel_header_button');
-    if (!btn || btn.__cthBlockBound) return;
-    btn.__cthBlockBound = true;
-    btn.onclick = function (e) {
-      if (!isGuest()) {
-        if (e && e.preventDefault) e.preventDefault();
-        handleBlockUser();
-        return;
-      }
+    // 사이트도 onload 에서 이 버튼에 lol_onclick_auth_or_block 을 대입한다 → 캡처로 가로챈다
+    bindOverSite('lol_rpanel_header_button', function (e) {
+      if (!isGuest()) { handleBlockUser(); return; }
+      // 게스트는 사이트 기본 동작(계정 코드 입력)에 맡긴다. 캡처에서 막았으므로 직접 부른다.
       if (typeof W.lol_onclick_auth_or_block === 'function') return W.lol_onclick_auth_or_block.call(this, e);
-    };
+    });
   }
 
   /* ---------------- 닉네임 변경 ----------------
@@ -1585,11 +1619,8 @@
      제한에 걸려 거부돼도 아무 안내 없이 조용히 끝난다(확인만 되고 안 바뀐 것처럼 보임).
      → 확장이 변경 전 경고를 띄우고, 신 API 응답의 실제 사유를 그대로 보여준다. */
   function installNicknameChange() {
-    const btn = document.getElementById('lol_lpanel_userinfo_menu_button_nickname_change');
-    if (!btn || btn.__cthNickBound) return;
-    btn.__cthNickBound = true;
-    btn.onclick = function (e) {
-      if (e) { e.preventDefault(); e.stopPropagation(); }
+    // 사이트도 onload 에서 이 버튼에 핸들러를 대입한다 → 캡처로 가로챈다
+    bindOverSite('lol_lpanel_userinfo_menu_button_nickname_change', function (e) {
       const menu = document.getElementById('lol_lpanel_userinfo_menu'); if (menu) menu.style.display = 'none';
       if (!hasAuth()) {   // 확장 인증이 없으면 사이트 기본 동작에 맡긴다
         if (typeof W.lol_onclick_userinfo_nickname_change === 'function') {
@@ -1599,7 +1630,7 @@
         return;
       }
       doChangeNickname();
-    };
+    });
   }
   async function doChangeNickname() {
     const cur = s(W.g_lol_user_info && W.g_lol_user_info.nickname);
@@ -1632,14 +1663,13 @@
      바꾸고 확장이 신 API로 목록 조회·개별 해제·일괄 해제를 처리한다. */
   function installBlockListMenu() {
     const btn = document.getElementById('lol_lpanel_userinfo_menu_button_blocklist_reset');
-    if (!btn || btn.__cthBlockList) return;
-    btn.__cthBlockList = true;
-    btn.textContent = '차단목록';
-    btn.onclick = (e) => {
-      if (e) { e.preventDefault(); e.stopPropagation(); }
+    if (!btn) return;
+    if (btn.textContent !== '차단목록') btn.textContent = '차단목록';   // 사이트는 글자를 건드리지 않는다
+    // 사이트 스텁(alert('만들기 귀찮아서 유기'))에 덮이지 않도록 캡처 단계에서 가로챈다
+    bindOverSite('lol_lpanel_userinfo_menu_button_blocklist_reset', function () {
       const m = document.getElementById('lol_lpanel_userinfo_menu'); if (m) m.style.display = 'none';
       showBlockListModal();
-    };
+    });
   }
   function closeBlockListModal() {
     const m = document.getElementById('cth-blocklist-modal'); if (m) m.remove();
